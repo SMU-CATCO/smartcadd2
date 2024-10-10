@@ -2,3 +2,5 @@ data/
 *.csv
 *.pt
 *.txt
+
+pytorch_geometric/
