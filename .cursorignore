@@ -4,3 +4,7 @@ data/
 *.txt
 
 pytorch_geometric/
+
+data/
+
+.DS_Store

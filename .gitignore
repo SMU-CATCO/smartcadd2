@@ -5,3 +5,7 @@ data/
 *.pt
 
 playground/
+
+data/
+
+.DS_Store
