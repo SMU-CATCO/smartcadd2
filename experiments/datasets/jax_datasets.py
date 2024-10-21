@@ -7,12 +7,13 @@ import numpy as np
 # Inspired by https://github.com/google-deepmind/jraph/blob/master/jraph/ogb_examples/train.py
 class PyG2JraphDataset:
     def __init__(
-        self, pyg_dataset, batch_size: int = 1, dynamically_batch: bool = False, shuffle: bool = False
+        self, pyg_dataset, batch_size: int = 1, shuffle: bool = False, pad_to_power_of_two: bool = False, dynamically_batch: bool = False, 
     ):
         self.pyg_dataset = pyg_dataset
         self.batch_size = batch_size
         self.dynamically_batch = dynamically_batch
         self.shuffle = shuffle
+        self.pad_to_power_of_two = pad_to_power_of_two
         self.max_num_nodes = max(data.num_nodes for data in pyg_dataset)
         self.max_num_edges = max(data.num_edges for data in pyg_dataset)
         self._indices = np.arange(len(pyg_dataset))
@@ -56,7 +57,10 @@ class PyG2JraphDataset:
                 self._current_index += 1
             batch = jraph.batch(batch)
 
-        return self._pad_graph_to_nearest_power_of_two(batch)
+        if self.pad_to_power_of_two:
+            return self._pad_graph_to_nearest_power_of_two(batch)
+        else:
+            return batch
 
     def get_graph_at_idx(self, idx):
         pyg_data = self.pyg_dataset[idx]
@@ -128,8 +132,8 @@ class PyG2JraphDataset:
 
 
 class QMXJraphDataset(PyG2JraphDataset):
-    def __init__(self, pyg_dataset, batch_size: int = 1, dynamically_batch: bool = False, shuffle: bool = False):
-        super().__init__(pyg_dataset, batch_size, dynamically_batch, shuffle)
+    def __init__(self, pyg_dataset, batch_size: int = 1, shuffle: bool = False, pad_to_power_of_two: bool = False, dynamically_batch: bool = False):
+        super().__init__(pyg_dataset, batch_size, shuffle, pad_to_power_of_two, dynamically_batch)
 
     def get_graph_at_idx(self, idx):
         pyg_data = self.pyg_dataset[idx]
@@ -147,10 +151,8 @@ class QMXJraphDataset(PyG2JraphDataset):
         global_features = {
             "y": jnp.array(pyg_data.y),
         }
-        if hasattr(pyg_data, "name"):
-            global_features["name"] = np.array([pyg_data.name])
-        if hasattr(pyg_data, "smiles"):
-            global_features["smiles"] = np.array([pyg_data.smiles])
+        if hasattr(pyg_data, "idx"):
+            global_features["idx"] = jnp.array(pyg_data.idx)
 
         return jraph.GraphsTuple(
             nodes=node_features,
