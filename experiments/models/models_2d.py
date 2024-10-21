@@ -1,7 +1,7 @@
 import torch
 from torch.nn import GRU, Linear, ReLU, Sequential, LeakyReLU
 import torch.nn.functional as F
-from torch_geometric.nn import NNConv, Set2Set, GATv2Conv
+from torch_geometric.nn import NNConv, Set2Set, GATv2Conv, global_mean_pool
 
 class Net(torch.nn.Module):
     def __init__(self, num_features, dim):
@@ -47,21 +47,25 @@ class GAT(torch.nn.Module):
         self.skip1 = Linear(dim, dim * heads if concat else dim)
 
     def forward(self, data):
-        x = F.relu(self.in_linear(data.x))
+        x, edge_index, batch = data.x, data.edge_index, data.batch
+        
+        x = F.relu(self.in_linear(x))
         
         # First GAT layer with skip connection
-        out1 = F.relu(self.conv1(x, data.edge_index))
+        out1 = F.relu(self.conv1(x, edge_index))
         out1 = out1 + self.skip1(x)
         
         # Second GAT layer with skip connection
-        out2 = F.relu(self.conv2(out1, data.edge_index))
-        out2 = out2 + out1  # Dimensions should match due to concat=False in conv2
+        out2 = F.relu(self.conv2(out1, edge_index))
+        out2 = out2 + out1
         
         # Third GAT layer with skip connection
-        out3 = F.relu(self.conv3(out2, data.edge_index))
+        out3 = F.relu(self.conv3(out2, edge_index))
         out3 = out3 + out2
         
-        # Final MLP
-        out = self.mlp(out3)
-        return out.view(-1)
+        # Global mean pooling
+        out = global_mean_pool(out3, batch)
         
+        # Final MLP
+        out = self.mlp(out)
+        return out.view(-1)

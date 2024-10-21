@@ -2,4 +2,5 @@ rdkit
 pandas
 numpy
 torch
+scipy
 scikit-learn
