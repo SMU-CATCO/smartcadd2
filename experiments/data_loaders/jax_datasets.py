@@ -5,7 +5,7 @@ import jax.numpy as jnp
 import numpy as np
 
 # Inspired by https://github.com/google-deepmind/jraph/blob/master/jraph/ogb_examples/train.py
-class PyG2JraphDataset:
+class PyG2JraphLoader:
     def __init__(
         self, pyg_dataset, batch_size: int = 1, shuffle: bool = False, pad_to_power_of_two: bool = False, dynamically_batch: bool = False, 
     ):
@@ -14,17 +14,17 @@ class PyG2JraphDataset:
         self.dynamically_batch = dynamically_batch
         self.shuffle = shuffle
         self.pad_to_power_of_two = pad_to_power_of_two
-        self.max_num_nodes = max(data.num_nodes for data in pyg_dataset)
-        self.max_num_edges = max(data.num_edges for data in pyg_dataset)
         self._indices = np.arange(len(pyg_dataset))
         if self.shuffle:
             np.random.shuffle(self._indices)
         self._current_index = 0
 
         if dynamically_batch:
+            self.max_num_nodes = max(data.num_nodes for data in pyg_dataset)
+            self.max_num_edges = max(data.num_edges for data in pyg_dataset)
             self.generator = jraph.dynamically_batch(
                 self._get_generator(),
-                n_node=self.batch_size * (self.max_num_nodes),
+                n_node=self.batch_size * (self.max_num_nodes) + 1,
                 n_edge=self.batch_size * (self.max_num_edges),
                 n_graph=self.batch_size,
             )
@@ -106,6 +106,7 @@ class PyG2JraphDataset:
         graph and node is added:
         8 nodes --> 9 nodes
         3 graphs --> 4 graphs
+        (Note: this is done because pad_with_graphs throws an error if the graph is already the size of pad_nodes_to)
 
         Args:
         graphs_tuple: a batched `GraphsTuple` (can be batch size 1).
@@ -113,14 +114,10 @@ class PyG2JraphDataset:
         Returns:
         A graphs_tuple batched to the nearest power of two.
         """
-        # Add 1 since we need at least one padding node for pad_with_graphs.
-        pad_nodes_to = (
-            PyG2JraphDataset._nearest_bigger_power_of_two(
-                jnp.sum(graphs_tuple.n_node)
-            )
-            + 1
+        pad_nodes_to = PyG2JraphLoader._nearest_bigger_power_of_two(
+            jnp.sum(graphs_tuple.n_node) + 1
         )
-        pad_edges_to = PyG2JraphDataset._nearest_bigger_power_of_two(
+        pad_edges_to = PyG2JraphLoader._nearest_bigger_power_of_two(
             jnp.sum(graphs_tuple.n_edge)
         )
         # Add 1 since we need at least one padding graph for pad_with_graphs.
@@ -131,7 +128,7 @@ class PyG2JraphDataset:
         )
 
 
-class QMXJraphDataset(PyG2JraphDataset):
+class QMXJraphLoader(PyG2JraphLoader):
     def __init__(self, pyg_dataset, batch_size: int = 1, shuffle: bool = False, pad_to_power_of_two: bool = False, dynamically_batch: bool = False):
         super().__init__(pyg_dataset, batch_size, shuffle, pad_to_power_of_two, dynamically_batch)
 

@@ -54,15 +54,35 @@ def make_complete(data):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train 2D models on QM9")
-    parser.add_argument("--dim", type=int, default=64, help="Dimension of the model")
-    parser.add_argument("--batch_size", type=int, default=128, help="Batch size")
-    parser.add_argument("--target", type=int, default=0, help="Target property")
-    parser.add_argument("--data_dir", type=str, default="data/qm9", help="Data directory")
-    parser.add_argument("--save_dir", type=str, default="artifacts", help="Directory to save artifacts")
-    parser.add_argument("--model", type=str, default="Net", help="Model to use")
-    parser.add_argument("--heads", type=int, default=4, help="Number of heads in GAT")
-    parser.add_argument("--concat", type=bool, default=True, help="Concatenate heads in GAT")
+    parser.add_argument(
+        "--dim", type=int, default=64, help="Dimension of the model"
+    )
+    parser.add_argument(
+        "--batch_size", type=int, default=128, help="Batch size"
+    )
+    parser.add_argument(
+        "--target", type=int, default=0, help="Target property"
+    )
+    parser.add_argument(
+        "--data_dir", type=str, default="data/qm9", help="Data directory"
+    )
+    parser.add_argument(
+        "--save_dir",
+        type=str,
+        default="artifacts",
+        help="Directory to save artifacts",
+    )
+    parser.add_argument(
+        "--model", type=str, default="Net", help="Model to use"
+    )
+    parser.add_argument(
+        "--heads", type=int, default=4, help="Number of heads in GAT"
+    )
+    parser.add_argument(
+        "--concat", type=bool, default=True, help="Concatenate heads in GAT"
+    )
     return parser.parse_args()
+
 
 if __name__ == "__main__":
     args = parse_args()
@@ -122,11 +142,12 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}", flush=True)
 
-
     if args.model == "Net":
         model = Net(NUM_FEATURES, args.dim).to(device)
     elif args.model == "GAT":
-        model = GAT(NUM_FEATURES, args.dim, heads=args.heads, concat=args.concat).to(device)
+        model = GAT(
+            NUM_FEATURES, args.dim, heads=args.heads, concat=args.concat
+        ).to(device)
     else:
         raise ValueError(f"Model {args.model} not found")
 

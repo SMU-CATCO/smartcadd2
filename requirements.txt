@@ -4,3 +4,8 @@ numpy
 torch
 scipy
 scikit-learn
+jax
+jaxlib
+jraph
+dm-haiku
+optax
