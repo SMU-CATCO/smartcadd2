@@ -65,13 +65,13 @@ def GAT_Layer(
         )
 
         # Compute the softmax weights on the entire tree.
-        weights = jraph.utils.segment_softmax(
+        weights = jraph.segment_softmax(
             softmax_logits, segment_ids=receivers, num_segments=sum_n_node
         )
         # Apply weights
         messages = sent_attributes * weights
         # Aggregate messages to nodes.
-        nodes = jraph.utils.segment_sum(
+        nodes = jraph.segment_sum(
             messages, segment_ids=receivers, num_segments=sum_n_node
         )
 
