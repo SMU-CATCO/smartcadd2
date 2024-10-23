@@ -20,8 +20,8 @@ fi
 CUDA_HOME="/usr/local/cuda-12"
 
 pip_install="pip install --upgrade -q 'jax[cuda12_local]' jraph dm-haiku optax torch-jax-interop -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html"
-python_script="python /work_dir/experiments/qm9/"${script_file}" --target 0 --dim 64 --batch_size 128 --data_dir /data --save_dir /artifacts/qm9 --model GAT --heads 8 --concat True"
-set_ld_library_path="export LD_LIBRARY_PATH='${CUDA_HOME}/lib64:${CUDA_HOME}/compat/lib.real:$LD_LIBRARY_PATH'"
+python_script="python /work_dir/experiments/qm9/"${script_file}" --target 0 --dim 256 --batch_size 128 --data_dir /data --save_dir /artifacts/qm9 --model GAT --heads 4 --concat True --max_nodes 29 --max_edges 812"
+# set_ld_library_path="export LD_LIBRARY_PATH='${CUDA_HOME}/lib64:${CUDA_HOME}/compat/lib.real:$LD_LIBRARY_PATH'"
 
 
 srun\

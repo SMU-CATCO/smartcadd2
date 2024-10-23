@@ -116,6 +116,20 @@ def pad_graph_to_nearest_power_of_two(
     )
 
 
+def pad_graph_to_max_size(
+    graphs_tuple: jraph.GraphsTuple, 
+    max_nodes: int,
+    max_edges: int,
+) -> jraph.GraphsTuple:
+    """Pads a batched `GraphsTuple` to the maximum graph size in the dataset."""
+    pad_nodes_to = max_nodes * graphs_tuple.n_node.shape[0] + 1
+    pad_edges_to = max_edges * graphs_tuple.n_node.shape[0]
+    pad_graphs_to = graphs_tuple.n_node.shape[0] + 1
+    return jraph.pad_with_graphs(
+        graphs_tuple, pad_nodes_to, pad_edges_to, pad_graphs_to
+    )
+
+
 class JraphLoader:
     def __init__(
         self,
@@ -123,11 +137,11 @@ class JraphLoader:
         pyg_to_jraph_fn: Callable[[Any], jraph.GraphsTuple] = pyg_to_jraph,
         batch_size: int = 1,
         shuffle: bool = False,
-        pad_to_power_of_two: bool = False,
+        pad_fn: Callable[[jraph.GraphsTuple], jraph.GraphsTuple] = None,
     ):
         self.pyg_loader = DataLoader(pyg_dataset, batch_size=batch_size, shuffle=shuffle)
         self.pyg_to_jraph_fn = pyg_to_jraph_fn
-        self.pad_to_power_of_two = pad_to_power_of_two
+        self.pad_fn = pad_fn
         
 
     def __len__(self):
@@ -139,7 +153,6 @@ class JraphLoader:
     
     def __next__(self):
         data = self.pyg_to_jraph_fn(next(self._iter_loader))
-        if self.pad_to_power_of_two:
-            data = pad_graph_to_nearest_power_of_two(data)
+        if self.pad_fn is not None:
+            data = self.pad_fn(data)
         return data
-
