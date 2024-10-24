@@ -1,8 +1,10 @@
+import functools
 from typing import Optional, Callable, Any, Tuple
 
 import jax
 import jax.numpy as jnp
 from jax.tree_util import Partial
+import jax.tree_util as tree
 import haiku as hk
 import jraph
 
@@ -161,15 +163,14 @@ class EGNNLayer(hk.Module):
 
     def _pos_update(
         self,
-        pos: jnp.ndarray,
         graph: jraph.GraphsTuple,
         coord_diff: jnp.ndarray,
     ) -> jnp.ndarray:
-        trans = coord_diff * self._pos_correction_mlp(graph.edges)
+        trans = coord_diff * self._pos_correction_mlp(graph.edges["edge_attr"])
         # NOTE: was in the original code
         trans = jnp.clip(trans, -100, 100)
         return self.pos_aggregate_fn(
-            trans, graph.senders, num_segments=pos.shape[0]
+            trans, graph.senders, num_segments=graph.nodes["pos"].shape[0]
         )
 
     def _message(
@@ -211,9 +212,12 @@ class EGNNLayer(hk.Module):
         return x
 
     def _coord2radial(
-        self, graph: jraph.GraphsTuple, coord: jnp.array
+        self, graph: jraph.GraphsTuple
     ) -> Tuple[jnp.array, jnp.array]:
-        coord_diff = coord[graph.senders] - coord[graph.receivers]
+        nodes, _, senders, receivers, _, _, _ = graph
+        coord = nodes["pos"]
+
+        coord_diff = coord[senders] - coord[receivers]
         radial = jnp.sum(coord_diff**2, 1)[:, jnp.newaxis]
         if self._normalize:
             norm = jnp.sqrt(radial)
@@ -223,7 +227,6 @@ class EGNNLayer(hk.Module):
     def __call__(
         self,
         graph: jraph.GraphsTuple,
-        pos: jnp.ndarray,
         edge_attribute: Optional[jnp.ndarray] = None,
         node_attribute: Optional[jnp.ndarray] = None,
     ) -> Tuple[jraph.GraphsTuple, jnp.ndarray]:
@@ -236,14 +239,140 @@ class EGNNLayer(hk.Module):
             edge_attribute: Edge attribute (optional)
             node_attribute: Node attribute (optional)
         """
-        radial, coord_diff = self._coord2radial(graph, pos)
 
-        graph = jraph.GraphNetwork(
+        radial, coord_diff = self._coord2radial(graph)
+
+        graph = GraphNetwork(
             update_edge_fn=Partial(self._message, radial, edge_attribute),
             update_node_fn=Partial(self._update, node_attribute),
             aggregate_edges_for_nodes_fn=self.msg_aggregate_fn,
         )(graph)
 
-        pos = pos + self._pos_update(pos, graph, coord_diff)
+        graph.nodes["pos"] = graph.nodes["pos"] + self._pos_update(graph, coord_diff)
 
-        return graph, pos
+        return graph
+
+
+class GraphNetwork(hk.Module):
+    def __init__(
+        self,
+        update_edge_fn: Optional[Callable],
+        update_node_fn: Optional[Callable],
+        update_global_fn: Optional[Callable] = None,
+        aggregate_edges_for_nodes_fn: Callable = jraph.utils.segment_sum,
+        aggregate_nodes_for_globals_fn: Callable = jraph.utils.segment_sum,
+        aggregate_edges_for_globals_fn: Callable = jraph.utils.segment_sum,
+        attention_logit_fn: Optional[Callable] = None,
+        attention_normalize_fn: Optional[Callable] = jraph.utils.segment_softmax,
+        attention_reduce_fn: Optional[Callable] = None,
+        name: Optional[str] = None,
+    ):
+        super().__init__(name=name)
+        self.update_edge_fn = update_edge_fn
+        self.update_node_fn = update_node_fn
+        self.update_global_fn = update_global_fn
+        self.aggregate_edges_for_nodes_fn = aggregate_edges_for_nodes_fn
+        self.aggregate_nodes_for_globals_fn = aggregate_nodes_for_globals_fn
+        self.aggregate_edges_for_globals_fn = aggregate_edges_for_globals_fn
+        self.attention_logit_fn = attention_logit_fn
+        self.attention_normalize_fn = attention_normalize_fn
+        self.attention_reduce_fn = attention_reduce_fn
+
+        if (attention_logit_fn is None) != (attention_reduce_fn is None):
+            raise ValueError(
+                "attention_logit_fn and attention_reduce_fn must both be supplied."
+            )
+
+    def __call__(self, graph):
+        nodes, edges, receivers, senders, globals_, n_node, n_edge = graph
+        sum_n_node = tree.tree_leaves(nodes)[0].shape[0]
+        sum_n_edge = senders.shape[0]
+
+        if not tree.tree_all(
+            tree.tree_map(lambda n: n.shape[0] == sum_n_node, nodes)
+        ):
+            raise ValueError(
+                "All node arrays in nest must contain the same number of nodes."
+            )
+
+        sent_attributes = tree.tree_map(lambda n: n[senders], nodes)
+        received_attributes = tree.tree_map(lambda n: n[receivers], nodes)
+        global_edge_attributes = tree.tree_map(
+            lambda g: jnp.repeat(
+                g, n_edge, axis=0, total_repeat_length=sum_n_edge
+            ),
+            globals_,
+        )
+
+        if self.update_edge_fn:
+            edges = self.update_edge_fn(
+                edges,
+                sent_attributes,
+                received_attributes,
+                global_edge_attributes,
+            )
+
+        if self.attention_logit_fn:
+            logits = self.attention_logit_fn(
+                edges,
+                sent_attributes,
+                received_attributes,
+                global_edge_attributes,
+            )
+            tree_calculate_weights = functools.partial(
+                self.attention_normalize_fn,
+                segment_ids=receivers,
+                num_segments=sum_n_node,
+            )
+            weights = tree.tree_map(tree_calculate_weights, logits)
+            edges = self.attention_reduce_fn(edges, weights)
+
+        if self.update_node_fn:
+            sent_attributes = tree.tree_map(
+                lambda e: self.aggregate_edges_for_nodes_fn(
+                    e, senders, sum_n_node
+                ),
+                edges,
+            )
+            received_attributes = tree.tree_map(
+                lambda e: self.aggregate_edges_for_nodes_fn(
+                    e, receivers, sum_n_node
+                ),
+                edges,
+            )
+            global_attributes = tree.tree_map(
+                lambda g: jnp.repeat(
+                    g, n_node, axis=0, total_repeat_length=sum_n_node
+                ),
+                globals_,
+            )
+            nodes = self.update_node_fn(
+                nodes, sent_attributes, received_attributes, global_attributes
+            )
+
+        if self.update_global_fn:
+            n_graph = n_node.shape[0]
+            graph_idx = jnp.arange(n_graph)
+            node_gr_idx = jnp.repeat(
+                graph_idx, n_node, axis=0, total_repeat_length=sum_n_node
+            )
+            edge_gr_idx = jnp.repeat(
+                graph_idx, n_edge, axis=0, total_repeat_length=sum_n_edge
+            )
+            node_attributes = tree.tree_map(
+                lambda n: self.aggregate_nodes_for_globals_fn(
+                    n, node_gr_idx, n_graph
+                ),
+                nodes,
+            )
+            edge_attributes = tree.tree_map(
+                lambda e: self.aggregate_edges_for_globals_fn(
+                    e, edge_gr_idx, n_graph
+                ),
+                edges,
+            )
+            globals_ = self.update_global_fn(
+                node_attributes, edge_attributes, globals_
+            )
+
+        return graph._replace(nodes=nodes, edges=edges, globals=globals_)

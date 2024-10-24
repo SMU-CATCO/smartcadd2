@@ -12,6 +12,7 @@ class GAT(hk.Module):
     def __init__(
         self,
         dim,
+        out_dim,
         num_heads,
         num_layers,
         concat=True,
@@ -19,6 +20,7 @@ class GAT(hk.Module):
     ):
         super().__init__(name="GAT")
         self.dim = dim
+        self.out_dim = out_dim
         self.num_heads = num_heads
         self.num_layers = num_layers
         self.concat = concat
@@ -44,7 +46,7 @@ class GAT(hk.Module):
             lambda x: jax.nn.leaky_relu(x, negative_slope=0.2),
             hk.Linear(dim, w_init=self.init_fn),
             lambda x: jax.nn.leaky_relu(x, negative_slope=0.2),
-            hk.Linear(1, w_init=self.init_fn),
+            hk.Linear(out_dim, w_init=self.init_fn),
         ])
 
     def __call__(self, graph):
@@ -115,10 +117,15 @@ class EGNN(hk.Module):
         self._normalize = normalize
         self._tanh = tanh
 
+        self.init_fn = hk.initializers.VarianceScaling(
+            scale=1.0, mode="fan_avg", distribution="uniform"
+        )
+        self.input_layer = hk.Linear(self._hidden_size, w_init=self.init_fn, name="embedding")
+        self.readout = hk.Linear(self._output_size, w_init=self.init_fn, name="readout")
+
     def __call__(
         self,
         graph: jraph.GraphsTuple,
-        pos: jnp.ndarray,
         edge_attribute: Optional[jnp.ndarray] = None,
         node_attribute: Optional[jnp.ndarray] = None,
     ) -> Tuple[jnp.ndarray, jnp.ndarray]:
@@ -127,23 +134,22 @@ class EGNN(hk.Module):
 
         Args:
             graph: Input graph
-            pos: Node position
             edge_attribute: Edge attribute (optional)
             node_attribute: Node attribute (optional)
 
         Returns:
             Tuple of updated node features and positions
         """
-        init_fn = hk.initializers.VarianceScaling(  
-            scale=1.0, mode="fan_avg", distribution="uniform"
-        )
+        nodes, _, _, _, _, _, _ = graph
+
         # input node embedding
-        h = hk.Linear(self._hidden_size, w_init=init_fn, name="embedding")(graph.nodes)
-        graph = graph._replace(nodes=h)
+        nodes["x"] = self.input_layer(nodes["x"])
+
+        graph = graph._replace(nodes=nodes)
 
         # message passing
         for n in range(self._num_layers):
-            graph, pos = EGNNLayer(
+            graph = EGNNLayer(
                 layer_num=n,
                 hidden_size=self._hidden_size,
                 output_size=self._hidden_size,
@@ -154,13 +160,12 @@ class EGNN(hk.Module):
                 tanh=self._tanh,
             )(
                 graph,
-                pos,
                 edge_attribute=edge_attribute,
                 node_attribute=node_attribute,
             )
         # node readout
-        h = hk.Linear(self._output_size, w_init=init_fn, name="readout")(graph.nodes)
-        return h, pos
+        h = self.readout(graph.nodes["x"])
+        return h, graph.nodes["pos"]
 
 
 # # Adapted from: https://github.com/google-deepmind/jraph/blob/master/jraph/_src/models.py

@@ -20,7 +20,7 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
 sys.path.insert(0, parent_dir)
 
-from models import GAT
+from models import GAT, EGNN
 from data_loaders import qmx_batch_to_jraph, pad_graph_to_max_size
 import utils
 
@@ -75,67 +75,6 @@ def parse_args():
         "--max_edges", type=int, default=None, help="Maximum number of edges"
     )
     return parser.parse_args()
-
-def create_model(model_name, dim, heads, concat):
-    if model_name == "GAT":
-
-        def net_fn(graph):
-            gat = GAT(dim=dim, num_heads=heads, num_layers=3, concat=concat)
-            return gat(graph)
-
-        # def net_fn(graph):
-        #     nodes, _, _, _, _, n_node, _ = graph
-        #     nodes = nodes["x"]
-        #     sum_n_node = tree.tree_leaves(nodes)[0].shape[0]
-
-        #     init_fn = hk.initializers.VarianceScaling(
-        #         scale=1.0, mode="fan_avg", distribution="uniform"
-        #     )
-
-        #     # Input linear layer
-        #     x = hk.Linear(dim, w_init=init_fn)(nodes)
-        #     x = jax.nn.relu(x)
-
-        #     # GAT layers with skip connections
-        #     for _ in range(3):
-        #         gat = GAT_Layer(
-        #             num_heads=heads,
-        #             per_head_channels=dim // heads,
-        #             attention_query_fn=lambda x: hk.Linear(dim, w_init=init_fn)(x),
-        #             attention_logit_fn=lambda q, k: hk.Linear(1, w_init=init_fn)(
-        #                 jax.nn.leaky_relu(
-        #                     jnp.concatenate([q, k], axis=-1),
-        #                     negative_slope=0.2,
-        #                 )
-        #             ),
-        #             node_update_fn=lambda x: (
-        #                 x if concat else jnp.mean(x, axis=1)
-        #             ),
-        #         )
-
-        #         # Apply GAT layer
-        #         gat_out = gat(graph._replace(nodes=x))
-
-        #         # Skip connection
-        #         x = x + hk.Linear(dim, w_init=init_fn)(gat_out.nodes)  
-        #         x = jax.nn.leaky_relu(x, negative_slope=0.2)
-
-        #     # Global mean pooling
-        #     graph_idx = jnp.repeat(jnp.arange(n_node.shape[0]), n_node, total_repeat_length=sum_n_node)
-        #     x = jraph.segment_mean(x, segment_ids=graph_idx, num_segments=n_node.shape[0])
-
-        #     # Final MLP
-        #     mlp = hk.Sequential([
-        #         hk.Linear(dim, w_init=init_fn), lambda x: jax.nn.leaky_relu(x, negative_slope=0.2),
-        #         hk.Linear(dim, w_init=init_fn), lambda x: jax.nn.leaky_relu(x, negative_slope=0.2),
-        #         hk.Linear(1, w_init=init_fn)
-        #     ])
-
-        #     return mlp(x).reshape(-1)
-
-        return hk.without_apply_rng(hk.transform(net_fn))
-    else:
-        raise ValueError(f"Model {model_name} not found")
 
 def load_and_preprocess_data(args):
     print(f"Loading data from {args.data_dir}", flush=True)
@@ -200,6 +139,21 @@ def load_and_preprocess_data(args):
     return train_loader, val_loader, test_loader, float(std), max_nodes, max_edges
 
 
+def create_model(model_name, dim, heads, concat):
+    net_fn = None
+    if model_name == "GAT":
+        net_fn = lambda graph: GAT(
+            dim=dim, out_dim=1, num_heads=heads, num_layers=3, concat=concat
+        )(graph)
+
+    elif model_name == "EGNN":
+        net_fn = lambda graph: EGNN(
+            hidden_size=dim, output_size=1, num_layers=3
+        )(graph)
+
+    return hk.without_apply_rng(hk.transform(net_fn))
+
+
 @partial(jax.jit, static_argnames=["model_fn"])
 def loss_fn(
     params,
@@ -224,11 +178,12 @@ def update(
     model_fn,
 ):
     loss, grads = jax.value_and_grad(loss_fn)(params, graph, target, model_fn)
-    updates, opt_state = optimizer_update(grads, opt_state)
+    updates, opt_state = optimizer_update(grads, opt_state, params)
     updates = optax.tree_utils.tree_scalar_mul(
         scheduler_scale, updates
     )
     params = optax.apply_updates(params, updates)
+
     return params, opt_state, loss
 
 
@@ -241,13 +196,12 @@ def evaluate(params, graph, target, std, model_fn):
 
 
 def train(args, model, train_loader, val_loader, test_loader, std, max_nodes, max_edges):
+    rng = jax.random.PRNGKey(42)
 
     graph_transform = lambda graph: pad_graph_to_max_size(qmx_batch_to_jraph(graph), max_nodes, max_edges)
 
-    graph_init = next(iter(train_loader)).to("cuda")
-    graph_init = graph_transform(graph_init)
+    graph_init = graph_transform(next(iter(train_loader)).to("cuda"))
 
-    rng = jax.random.PRNGKey(42)
     params = model.init(rng, graph_init)
 
     optimizer = optax.chain(
@@ -278,7 +232,7 @@ def train(args, model, train_loader, val_loader, test_loader, std, max_nodes, ma
     for epoch in pbar:
 
         # Training
-        epoch_loss = loss = 0
+        epoch_loss = 0
         for graph in train_loader:
             graph = graph.to("cuda")
             graph = graph_transform(graph)
@@ -326,7 +280,7 @@ def train(args, model, train_loader, val_loader, test_loader, std, max_nodes, ma
         pbar.set_postfix({
             "Epoch": epoch,
             "LR": scheduler_state.scale * args.lr,
-            "Loss": loss,
+            "Loss": epoch_loss,
             "Val MAE": val_error,
             "Best Test MAE": best_test_error,
             "Peak Memory": peak_memory,
