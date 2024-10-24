@@ -4,6 +4,7 @@ import sys
 import jax
 import jax.profiler
 import jax.numpy as jnp
+import jax.tree_util as tree
 import haiku as hk
 import jraph
 import optax
@@ -75,11 +76,12 @@ def parse_args():
     )
     return parser.parse_args()
 
-def create_model(model_name, dim, heads, concat, total_repeat_length):
+def create_model(model_name, dim, heads, concat):
     if model_name == "GAT":
         def net_fn(graph):
             nodes, _, _, _, _, n_node, _ = graph
             nodes = nodes["x"]
+            sum_n_node = tree.tree_leaves(nodes)[0].shape[0]
 
             # Input linear layer
             x = hk.Linear(dim)(nodes)
@@ -110,7 +112,7 @@ def create_model(model_name, dim, heads, concat, total_repeat_length):
                 x = jax.nn.leaky_relu(x, negative_slope=0.2)
 
             # Global mean pooling
-            graph_idx = jnp.repeat(jnp.arange(n_node.shape[0]), n_node, total_repeat_length=n_node.sum())
+            graph_idx = jnp.repeat(jnp.arange(n_node.shape[0]), n_node, total_repeat_length=sum_n_node)
             x = jraph.segment_mean(x, segment_ids=graph_idx, num_segments=n_node.shape[0])
 
             # Final MLP
@@ -331,7 +333,7 @@ if __name__ == "__main__":
     train_loader, val_loader, test_loader, std, max_nodes, max_edges = load_and_preprocess_data(args)
 
     # Initialize model
-    model = create_model(args.model, args.dim, args.heads, args.concat, total_repeat_length=(max_nodes * args.batch_size) + 1)
+    model = create_model(args.model, args.dim, args.heads, args.concat)
 
     # Train the model
     best_params, best_test_error = train(args, model, train_loader, val_loader, test_loader, std, max_nodes, max_edges)
