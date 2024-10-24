@@ -20,7 +20,7 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
 sys.path.insert(0, parent_dir)
 
-from models import GAT_Layer
+from models import GAT
 from data_loaders import qmx_batch_to_jraph, pad_graph_to_max_size
 import utils
 
@@ -78,51 +78,60 @@ def parse_args():
 
 def create_model(model_name, dim, heads, concat):
     if model_name == "GAT":
+
         def net_fn(graph):
-            nodes, _, _, _, _, n_node, _ = graph
-            nodes = nodes["x"]
-            sum_n_node = tree.tree_leaves(nodes)[0].shape[0]
+            gat = GAT(dim=dim, num_heads=heads, num_layers=3, concat=concat)
+            return gat(graph)
 
-            # Input linear layer
-            x = hk.Linear(dim)(nodes)
-            x = jax.nn.relu(x)
+        # def net_fn(graph):
+        #     nodes, _, _, _, _, n_node, _ = graph
+        #     nodes = nodes["x"]
+        #     sum_n_node = tree.tree_leaves(nodes)[0].shape[0]
 
-            # GAT layers with skip connections
-            for _ in range(3):
-                gat = GAT_Layer(
-                    num_heads=heads,
-                    per_head_channels=dim // heads,
-                    attention_query_fn=lambda x: hk.Linear(dim)(x),
-                    attention_logit_fn=lambda q, k: hk.Linear(1)(
-                        jax.nn.leaky_relu(
-                            jnp.concatenate([q, k], axis=-1),
-                            negative_slope=0.2,
-                        )
-                    ),
-                    node_update_fn=lambda x: (
-                        x if concat else jnp.mean(x, axis=1)
-                    ),
-                )
+        #     init_fn = hk.initializers.VarianceScaling(
+        #         scale=1.0, mode="fan_avg", distribution="uniform"
+        #     )
 
-                # Apply GAT layer
-                gat_out = gat(graph._replace(nodes=x))
+        #     # Input linear layer
+        #     x = hk.Linear(dim, w_init=init_fn)(nodes)
+        #     x = jax.nn.relu(x)
 
-                # Skip connection
-                x = x + hk.Linear(dim)(gat_out.nodes)  
-                x = jax.nn.leaky_relu(x, negative_slope=0.2)
+        #     # GAT layers with skip connections
+        #     for _ in range(3):
+        #         gat = GAT_Layer(
+        #             num_heads=heads,
+        #             per_head_channels=dim // heads,
+        #             attention_query_fn=lambda x: hk.Linear(dim, w_init=init_fn)(x),
+        #             attention_logit_fn=lambda q, k: hk.Linear(1, w_init=init_fn)(
+        #                 jax.nn.leaky_relu(
+        #                     jnp.concatenate([q, k], axis=-1),
+        #                     negative_slope=0.2,
+        #                 )
+        #             ),
+        #             node_update_fn=lambda x: (
+        #                 x if concat else jnp.mean(x, axis=1)
+        #             ),
+        #         )
 
-            # Global mean pooling
-            graph_idx = jnp.repeat(jnp.arange(n_node.shape[0]), n_node, total_repeat_length=sum_n_node)
-            x = jraph.segment_mean(x, segment_ids=graph_idx, num_segments=n_node.shape[0])
+        #         # Apply GAT layer
+        #         gat_out = gat(graph._replace(nodes=x))
 
-            # Final MLP
-            mlp = hk.Sequential([
-                hk.Linear(dim), lambda x: jax.nn.leaky_relu(x, negative_slope=0.2),
-                hk.Linear(dim), lambda x: jax.nn.leaky_relu(x, negative_slope=0.2),
-                hk.Linear(1)
-            ])
+        #         # Skip connection
+        #         x = x + hk.Linear(dim, w_init=init_fn)(gat_out.nodes)  
+        #         x = jax.nn.leaky_relu(x, negative_slope=0.2)
 
-            return mlp(x)
+        #     # Global mean pooling
+        #     graph_idx = jnp.repeat(jnp.arange(n_node.shape[0]), n_node, total_repeat_length=sum_n_node)
+        #     x = jraph.segment_mean(x, segment_ids=graph_idx, num_segments=n_node.shape[0])
+
+        #     # Final MLP
+        #     mlp = hk.Sequential([
+        #         hk.Linear(dim, w_init=init_fn), lambda x: jax.nn.leaky_relu(x, negative_slope=0.2),
+        #         hk.Linear(dim, w_init=init_fn), lambda x: jax.nn.leaky_relu(x, negative_slope=0.2),
+        #         hk.Linear(1, w_init=init_fn)
+        #     ])
+
+        #     return mlp(x).reshape(-1)
 
         return hk.without_apply_rng(hk.transform(net_fn))
     else:
@@ -201,23 +210,23 @@ def loss_fn(
     pred = model_fn(params, graph)
     mask = jraph.get_graph_padding_mask(graph)
     errors = jnp.square(pred - target)
-    return jnp.sum(jnp.where(mask, errors, 0)) / jnp.sum(mask)
+    return (errors * mask).sum() / mask.sum()
 
 
 @partial(jax.jit, static_argnames=["optimizer_update", "model_fn"])
 def update(
     params,
     opt_state,
-    scheduler_state,
     graph,
     target,
+    scheduler_scale,
     optimizer_update,
-    model_fn
+    model_fn,
 ):
     loss, grads = jax.value_and_grad(loss_fn)(params, graph, target, model_fn)
     updates, opt_state = optimizer_update(grads, opt_state)
     updates = optax.tree_utils.tree_scalar_mul(
-        scheduler_state.scale, updates
+        scheduler_scale, updates
     )
     params = optax.apply_updates(params, updates)
     return params, opt_state, loss
@@ -242,7 +251,7 @@ def train(args, model, train_loader, val_loader, test_loader, std, max_nodes, ma
     params = model.init(rng, graph_init)
 
     optimizer = optax.chain(
-        optax.clip_by_global_norm(3.0),  # Add gradient clipping
+        optax.clip_by_global_norm(3.0),  
         optax.adam(learning_rate=args.lr)
     )
     opt_state = optimizer.init(params)
@@ -276,9 +285,9 @@ def train(args, model, train_loader, val_loader, test_loader, std, max_nodes, ma
             params, opt_state, loss = update(
                 params,
                 opt_state,
-                scheduler_state,
                 graph,
                 graph.globals["y"],
+                scheduler_state.scale,
                 optimizer_update,
                 model_fn
             )
