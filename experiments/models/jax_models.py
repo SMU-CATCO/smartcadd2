@@ -16,9 +16,9 @@ class GAT(hk.Module):
         num_heads,
         num_layers,
         concat=True,
-        name=None,
+        name="GAT",
     ):
-        super().__init__(name="GAT")
+        super().__init__(name=name)
         self.dim = dim
         self.out_dim = out_dim
         self.num_heads = num_heads
@@ -31,22 +31,22 @@ class GAT(hk.Module):
 
         self.input_layer = lambda x: jax.nn.relu(hk.Linear(dim, w_init=self.init_fn)(x))
 
-        self.gat_layers = [
-            GATLayer(dim, num_heads, concat, name=f"gat_layer_{i}")
-            for i in range(num_layers)
-        ]
+        self.gat_layers = [GATLayer(self.dim, self.num_heads, self.concat, name=f"gat_layer_0")]
+        for i in range(1, self.num_layers):
+            self.gat_layers.append(GATLayer(self.dim * self.num_heads, num_heads=1, concat=False, name=f"gat_layer_{i}"))
+
 
         self.skip_connections = [
-            hk.Linear(dim, w_init=self.init_fn, name=f"skip_connection_{i}")
-            for i in range(num_layers)
+            hk.Linear(self.dim * self.num_heads, w_init=self.init_fn, name=f"skip_connection_{i}")
+            for i in range(self.num_layers)
         ]
 
         self.mlp = hk.Sequential([
-            hk.Linear(dim, w_init=self.init_fn),
+            hk.Linear(self.dim * self.num_heads, w_init=self.init_fn),
             lambda x: jax.nn.leaky_relu(x, negative_slope=0.2),
-            hk.Linear(dim, w_init=self.init_fn),
+            hk.Linear(self.dim * self.num_heads, w_init=self.init_fn),
             lambda x: jax.nn.leaky_relu(x, negative_slope=0.2),
-            hk.Linear(out_dim, w_init=self.init_fn),
+            hk.Linear(self.out_dim, w_init=self.init_fn),
         ])
 
     def __call__(self, graph):
@@ -60,7 +60,7 @@ class GAT(hk.Module):
             graph_out = self.gat_layers[i](graph._replace(nodes=x))
 
             # skip connection
-            x = x + self.skip_connections[i](graph_out.nodes)
+            x = graph_out.nodes + self.skip_connections[i](x)
             x = jax.nn.leaky_relu(x, negative_slope=0.2)
 
         # global mean pooling

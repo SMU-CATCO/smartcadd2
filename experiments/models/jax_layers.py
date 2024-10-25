@@ -10,52 +10,64 @@ import jraph
 
 
 class GATLayer(hk.Module):
+    """Implements GATv2Layer"""
     def __init__(
         self,
         dim,
         num_heads,
         concat=True,
+        share_weights=False,
         name=None,
     ):
         super().__init__(name=name)
         self.dim = dim
         self.num_heads = num_heads
-        self.per_head_channels = dim // num_heads
         self.concat = concat
-
+        self.share_weights = share_weights
         self.init_fn = hk.initializers.VarianceScaling(
             scale=1.0, mode="fan_avg", distribution="uniform"
         )
 
         # node update function
-        self.node_update_fn = lambda x: x if concat else jnp.mean(x, axis=1)
+        self.node_update_fn = lambda x: x 
 
-        # attention functions
-        self.attention_query_fn = lambda x: hk.Linear(
-            dim, w_init=self.init_fn
+        # query functions
+        self.attention_query_l = lambda x: hk.Linear(
+            dim * num_heads, w_init=self.init_fn, name="attention_query_l"
         )(x)
 
+        self.attention_query_r = (
+            self.attention_query_l
+            if self.share_weights
+            else lambda x: hk.Linear(
+                dim * num_heads, w_init=self.init_fn, name="attention_query_r"
+            )(x)
+        )
+
         self.attention_logit_fn = lambda q, k: hk.Linear(
-            1, w_init=self.init_fn
+            1, w_init=self.init_fn, name="attention_logit_fn"
         )(
-            jax.nn.leaky_relu(
-                jnp.concatenate([q, k], axis=-1), negative_slope=0.2
-            )
+            jax.nn.leaky_relu(q + k, negative_slope=0.2)
         )
 
     def __call__(self, graph):
         nodes, _, receivers, senders, _, _, _ = graph
-        sum_n_node = nodes.shape[0]
+        sum_n_node = tree.tree_leaves(nodes)[0].shape[0]
 
-        # Linear transformation for each head
-        nodes_transformed = self.attention_query_fn(nodes)
-        nodes_transformed = nodes_transformed.reshape(
-            -1, self.num_heads, self.per_head_channels
+        # Linear transformation 
+        nodes_transformed_l = self.attention_query_l(nodes).reshape(
+            -1, self.num_heads, self.dim
         )
+        if not self.share_weights:
+            nodes_transformed_r = self.attention_query_r(nodes).reshape(
+                -1, self.num_heads, self.dim
+            )
+        else:
+            nodes_transformed_r = nodes_transformed_l
 
         # Compute attention logits
-        sent_attributes = nodes_transformed[senders]
-        received_attributes = nodes_transformed[receivers]
+        sent_attributes = nodes_transformed_l[senders]
+        received_attributes = nodes_transformed_r[receivers]
         attention_logits = self.attention_logit_fn(
             sent_attributes, received_attributes
         )
@@ -73,13 +85,17 @@ class GATLayer(hk.Module):
             out, segment_ids=receivers, num_segments=sum_n_node
         )
 
-        # Concatenate or average the multi-head results
-        out = out.reshape(sum_n_node, -1)  # Concatenate by default
+        # # Concatenate or average the multi-head results
+        if self.concat:
+            out = out.reshape(sum_n_node, self.dim * self.num_heads)
+        else:
+            out = jnp.mean(out, axis=1)
 
         # Apply final update function
         nodes = self.node_update_fn(out)
 
         return graph._replace(nodes=nodes)
+
 
 # Adapted from https://github.com/gerkone/egnn-jax/blob/main/egnn_jax/egnn.py
 class EGNNLayer(hk.Module):
@@ -143,7 +159,11 @@ class EGNNLayer(hk.Module):
         net = [hk.Linear(hidden_size, w_init=self.init_fn), act_fn]
 
         # NOTE: from https://github.com/vgsatorras/egnn/blob/main/models/gcl.py#L254
-        net += [hk.Linear(1, with_bias=False, w_init=hk.initializers.UniformScaling(dt))]
+        net += [
+            hk.Linear(
+                1, with_bias=False, w_init=hk.initializers.UniformScaling(dt)
+            )
+        ]
         if tanh:
             net.append(jax.nn.tanh)
         self._pos_correction_mlp = hk.Sequential(net)
@@ -248,7 +268,9 @@ class EGNNLayer(hk.Module):
             aggregate_edges_for_nodes_fn=self.msg_aggregate_fn,
         )(graph)
 
-        graph.nodes["pos"] = graph.nodes["pos"] + self._pos_update(graph, coord_diff)
+        graph.nodes["pos"] = graph.nodes["pos"] + self._pos_update(
+            graph, coord_diff
+        )
 
         return graph
 
@@ -259,11 +281,11 @@ class GraphNetwork(hk.Module):
         update_edge_fn: Optional[Callable],
         update_node_fn: Optional[Callable],
         update_global_fn: Optional[Callable] = None,
-        aggregate_edges_for_nodes_fn: Callable = jraph.utils.segment_sum,
-        aggregate_nodes_for_globals_fn: Callable = jraph.utils.segment_sum,
-        aggregate_edges_for_globals_fn: Callable = jraph.utils.segment_sum,
+        aggregate_edges_for_nodes_fn: Callable = jraph.segment_sum,
+        aggregate_nodes_for_globals_fn: Callable = jraph.segment_sum,
+        aggregate_edges_for_globals_fn: Callable = jraph.segment_sum,
         attention_logit_fn: Optional[Callable] = None,
-        attention_normalize_fn: Optional[Callable] = jraph.utils.segment_softmax,
+        attention_normalize_fn: Optional[Callable] = jraph.segment_softmax,
         attention_reduce_fn: Optional[Callable] = None,
         name: Optional[str] = None,
     ):
