@@ -3,6 +3,8 @@ from torch_geometric.data import Dataset
 from torch_geometric.loader import DataLoader
 from torch_geometric.data import Data, Batch
 
+import torch
+
 import jax
 import jraph
 import jax.numpy as jnp
@@ -40,7 +42,7 @@ def pyg_to_jraph(pyg_data):
 def qmx_batch_to_jraph(pyg_batch):
     node_features = {
         "x": torch_to_jax(pyg_batch.x),
-        "z": torch_to_jax(pyg_batch.z),
+        "z": torch_to_jax(pyg_batch.z.to(torch.int32)),
         "pos": torch_to_jax(pyg_batch.pos),
     }
     edge_features = {
@@ -53,11 +55,11 @@ def qmx_batch_to_jraph(pyg_batch):
         "y": torch_to_jax(pyg_batch.y),
     }
     if hasattr(pyg_batch, "idx"):
-        global_features["idx"] = torch_to_jax(pyg_batch.idx)
+        global_features["idx"] = torch_to_jax(pyg_batch.idx.to(torch.int32))
 
     if isinstance(pyg_batch, Batch):
-        n_node = torch_to_jax(pyg_batch.ptr[1:] - pyg_batch.ptr[:-1])
-        n_edge = torch_to_jax(pyg_batch.batch[pyg_batch.edge_index[0]].unique(return_counts=True)[1])
+        n_node = torch_to_jax((pyg_batch.ptr[1:] - pyg_batch.ptr[:-1]).to(torch.int32))
+        n_edge = torch_to_jax(pyg_batch.batch[pyg_batch.edge_index[0]].unique(return_counts=True)[1].to(torch.int32))
     elif isinstance(pyg_batch, Data):
         n_node = jnp.array([pyg_batch.num_nodes])
         n_edge = jnp.array([pyg_batch.num_edges])
@@ -65,8 +67,8 @@ def qmx_batch_to_jraph(pyg_batch):
     return jraph.GraphsTuple(
         nodes=node_features,
         edges=edge_features,
-        senders=torch_to_jax(pyg_batch.edge_index[0]),
-        receivers=torch_to_jax(pyg_batch.edge_index[1]),
+        senders=torch_to_jax(pyg_batch.edge_index[0].to(torch.int32)),
+        receivers=torch_to_jax(pyg_batch.edge_index[1].to(torch.int32)),
         n_node=n_node,
         n_edge=n_edge,
         globals=global_features,

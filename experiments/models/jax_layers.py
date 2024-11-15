@@ -1,13 +1,17 @@
 import functools
-from typing import Optional, Callable, Any, Tuple
+from typing import List, Optional, Callable, Any, Tuple
 
 import jax
 import jax.numpy as jnp
 from jax.tree_util import Partial
 import jax.tree_util as tree
+from jax_md.partition import NeighborList
 import haiku as hk
 import jraph
+import e3nn_jax as e3nn
 
+
+from utils import shifted_softplus, normalized_bessel, u
 
 class GATLayer(hk.Module):
     """Implements GATv2Layer"""
@@ -32,16 +36,16 @@ class GATLayer(hk.Module):
         self.node_update_fn = lambda x: x 
 
         # query functions
-        self.attention_query_l = lambda x: hk.Linear(
+        self.attention_query_l = hk.Linear(
             dim * num_heads, w_init=self.init_fn, name="attention_query_l"
-        )(x)
+        )
 
         self.attention_query_r = (
             self.attention_query_l
             if self.share_weights
-            else lambda x: hk.Linear(
+            else hk.Linear(
                 dim * num_heads, w_init=self.init_fn, name="attention_query_r"
-            )(x)
+            )
         )
 
         self.attention_logit_fn = lambda q, k: hk.Linear(
@@ -398,3 +402,419 @@ class GraphNetwork(hk.Module):
             )
 
         return graph._replace(nodes=nodes, edges=edges, globals=globals_)
+
+### SchNet Layers ###
+
+
+class Aggregate(hk.Module):
+    """Pooling layer based on sum or average with optional masking.
+
+    Args:
+        axis (int): axis along which pooling is done.
+        mean_pooling (bool, optional): if True, use average instead for sum pooling.
+        keepdim (bool, optional): whether the output tensor has dim retained or not.
+
+    """
+
+    def __init__(self, axis: int, mean_pooling=False, keepdim=True):
+        super().__init__(name="Aggregate")
+        self.axis = axis
+        self.mean_pooling = mean_pooling
+        self.keepdim = keepdim
+
+    def __call__(self, input: jnp.ndarray, mask=None):
+        # mask input
+        if mask is not None:
+            input = input * mask[..., None]
+
+        # compute sum of input along axis
+        y = jnp.sum(input, self.axis)
+
+        # compute average of input along axis
+        if self.mean_pooling:
+
+            # get the number of items along axis
+            if mask is not None:
+                N = jnp.sum(mask, self.axis, keepdim=self.keepdim)
+                N = jnp.max(N, other=jnp.ones_like(N))
+
+            else:
+                # N = input.size(self.axis)
+                N = input.shape(self.axis)
+
+            y = y / N
+
+        return y
+
+
+class FilterNetwork(hk.Module):
+    def __init__(self, n_filters: int):
+        super().__init__(name="FilterNetwork")
+
+        self.linear_0 = hk.Sequential(
+            [hk.Linear(n_filters, name="linear_0"), shifted_softplus]
+        )  # n_spatial_basis -> n_filters
+        self.linear_1 = hk.Linear(
+            n_filters, name="linear_1"
+        )  # n_filters -> n_filters
+
+    def __call__(self, x: jnp.ndarray):
+        x = self.linear_0(x)
+        hk.set_state(
+            self.linear_0.layers[0].name, x
+        )  # w/o referencing layer 0, the key would be "Sequential".
+
+        x = self.linear_1(x)
+        hk.set_state(self.linear_1.name, x)
+
+        return x
+
+
+class CosineCutoff(hk.Module):
+
+    def __init__(self, r_cutoff: float):
+        super().__init__(name="CosineCutoff")
+        self.r_cutoff = jnp.float32(r_cutoff)
+
+    def __call__(self, dR: jnp.ndarray) -> jnp.ndarray:
+        cutoffs = 0.5 * (jnp.cos(dR * jnp.pi / self.r_cutoff) + 1.0)
+        cutoffs *= dR < self.r_cutoff
+        hk.set_state(self.name, cutoffs)
+        return cutoffs
+
+
+class CFConv(hk.Module):
+
+    def __init__(
+        self,
+        n_filters: int,
+        n_out: int,
+        r_cutoff: float,
+        activation,
+        normalize_filter=False,
+        axis=1,
+    ):
+        super().__init__(name="CFConv")
+
+        self.filter_network = FilterNetwork(n_filters)
+        self.cutoff_network = CosineCutoff(r_cutoff)
+
+        self.in2f = hk.Linear(n_filters, with_bias=False, name="in2f")
+        self.f2out = hk.Sequential(
+            [hk.Linear(n_out, with_bias=True, name="f2out"), activation]
+        )
+
+        self.aggregate = Aggregate(axis=axis, mean_pooling=normalize_filter)
+
+    @staticmethod
+    def _reshape_y(y: jnp.ndarray, neighbors: NeighborList) -> jnp.ndarray:
+        nbh_size = neighbors.idx.shape
+
+        # use SchNetPack's 0-padding approach to obtain *exactly* the same results after this reshaping operation.
+        nbh_indices = neighbors.idx
+        # padding_mask = nbh_indices == nbh_indices.shape[0]
+        # nbh_indices[padding_mask] = 0
+
+        # (n_atoms, max_occupancy) -> (n_atoms * max_occupancy, 1)
+        # for batches, use shape (-1, nbh_size[1] * nbh_size[2], 1)
+        nbh = nbh_indices.reshape((nbh_size[0] * nbh_size[1], 1))
+
+        # (n_atoms * max_occupancy, 1) -> (n_atoms * max_occupancy, n_filters)
+        nbh = jnp.tile(nbh, (1, y.shape[1]))
+
+        # (n_atoms, n_filters) -> (n_atoms * max_occupancy, n_filters)
+        y = jnp.take_along_axis(y, indices=nbh, axis=0)
+
+        # (n_atoms * max_occupancy, n_filters) -> (n_atoms, max_occupancy, n_filters)
+        y = jnp.reshape(y, (nbh_size[0], nbh_size[1], -1))
+        return y
+
+    def __call__(
+        self,
+        x: jnp.ndarray,
+        dR: jnp.ndarray,
+        neighbors: NeighborList,
+        dR_expanded: jnp.ndarray,
+    ):
+        if dR_expanded is None:
+            # Insert a new dimension (size 1) at the last position
+            # (n_atoms, max_occupancy) -> (n_atoms, max_occupancy, 1)
+            dR_expanded = jnp.expand_dims(dR, axis=-1)
+
+        # pass expanded interactomic distances through filter block
+        W = self.filter_network(dR_expanded)
+
+        # apply cutoff
+        if self.cutoff_network is not None:
+            C = self.cutoff_network(dR)
+            W = W * jnp.expand_dims(C, axis=-1)
+
+        # pass initial embeddings through dense layer. reshape y for element-wise multiplication by W.
+        y = self.in2f(x)
+        hk.set_state(self.in2f.name, y)
+        y = self._reshape_y(y, neighbors)
+
+        # element-wise multiplication, aggregation and dense output layer.
+        y = y * W
+
+        # aggregate over neighborhoods, skip padded indices.
+        actual_indices_mask = neighbors.idx != neighbors.idx.shape[0]
+        y = self.aggregate(y, actual_indices_mask)
+        hk.set_state(self.aggregate.name, y)
+
+        y = self.f2out(y)
+        hk.set_state(self.f2out.layers[0].name, y)
+
+        return y
+
+
+class Interaction(hk.Module):
+    def __init__(
+        self,
+        idx: int,
+        n_atom_basis: int,
+        n_filters: int,
+        n_spatial_basis: int,
+        r_cutoff: float,
+        normalize_filter: bool,
+    ):
+        super().__init__(name="Interaction_{}".format(idx))
+        self.cfconv = CFConv(
+            n_filters,
+            n_atom_basis,
+            r_cutoff,
+            activation=shifted_softplus,
+            normalize_filter=normalize_filter,
+        )
+        self.dense = hk.Linear(n_atom_basis, name="Output")
+
+    def __call__(
+        self,
+        x: jnp.ndarray,
+        dR: jnp.ndarray,
+        neighbors: NeighborList,
+        dR_expanded=None,
+    ):
+        """Compute convolution block.
+
+        Args:
+            x: input representation/embedding of atomic environments with (N_a, n_in) shape.
+            dR: interatomic distances of (N_a, N_nbh) shape.
+            neighbors: neighbor list with neighbor indices in (N_a, N_nbh) shape.
+            pairwise_mask: mask to filter out non-existing neighbors introduced via padding.
+            dR_expanded (optional): expanded interatomic distances in a basis.
+                If None, dR.unsqueeze(-1) is used.
+
+        Returns:
+            jnp.ndarray: block output with (N_a, n_out) shape.
+
+        """
+        x = self.cfconv(x, dR, neighbors, dR_expanded)
+        x = self.dense(x)
+        hk.set_state(self.dense.name, x)
+        return x
+
+
+class GaussianSmearing(hk.Module):
+    def __init__(
+        self,
+        start=0.0,
+        stop=5.0,
+        n_gaussians=50,
+        centered=False,
+        trainable=False,
+    ):
+        super().__init__(name="GaussianSmearing")
+        self.offset = jnp.linspace(start, stop, n_gaussians)
+        self.widths = (self.offset[1] - self.offset[0]) * jnp.ones_like(
+            self.offset
+        )
+        # TODO: trainable
+        self.centered = centered
+
+    def _smearing(self, distances: jnp.ndarray) -> jnp.ndarray:
+        """Smear interatomic distance values using Gaussian functions."""
+
+        if not self.centered:
+            # compute width of Gaussian functions (using an overlap of 1 STDDEV)
+            coeff = -0.5 / jnp.power(self.widths, 2)
+            # Use advanced indexing to compute the individual components
+            # diff = distances[:, :, :, None] - self.offset[None, None, None, :]
+            diff = (
+                distances[:, :, None] - self.offset[None, None, :]
+            )  # skip batches for now
+        else:
+            # if Gaussian functions are centered, use offsets to compute widths
+            coeff = -0.5 / jnp.power(self.offset, 2)
+            # if Gaussian functions are centered, no offset is subtracted
+            # diff = distances[:, :, :, None]
+            diff = distances[:, :, None]  # skip batches for now
+
+        # compute smear distance values
+        gauss = jnp.exp(coeff * jnp.power(diff, 2))
+        return gauss
+
+    def __call__(self, distances: jnp.ndarray, *args, **kwargs):
+        smearing = self._smearing(distances)
+        hk.set_state(self.name, smearing)
+        return smearing
+
+
+### Allegro Layers ###
+
+
+def filter_layers(
+    layer_irreps: List[e3nn.Irreps], max_ell: int
+) -> List[e3nn.Irreps]:
+    layer_irreps = list(layer_irreps)
+    filtered = [e3nn.Irreps(layer_irreps[-1])]
+    for irreps in reversed(layer_irreps[:-1]):
+        irreps = e3nn.Irreps(irreps)
+        irreps = irreps.filter(
+            keep=e3nn.tensor_product(
+                filtered[0],
+                e3nn.Irreps.spherical_harmonics(lmax=max_ell),
+            ).regroup()
+        )
+        filtered.insert(0, irreps)
+    return filtered
+
+
+def allegro_layer_call(
+    Linear,
+    MultiLayerPerceptron,
+    output_irreps: e3nn.Irreps,
+    self,
+    vectors: e3nn.IrrepsArray,  # [n_edges, 3]
+    x: jnp.ndarray,  # [n_edges, features]
+    V: e3nn.IrrepsArray,  # [n_edges, irreps]
+    senders: jnp.ndarray,  # [n_edges]
+) -> e3nn.IrrepsArray:
+    num_edges = vectors.shape[0]
+    assert vectors.shape == (num_edges, 3)
+    assert x.shape == (num_edges, x.shape[-1])
+    assert V.shape == (num_edges, V.irreps.dim)
+    assert senders.shape == (num_edges,)
+
+    irreps_out = e3nn.Irreps(output_irreps)
+
+    w = MultiLayerPerceptron((V.irreps.mul_gcd,), act=None)(x)
+    Y = e3nn.spherical_harmonics(range(self.max_ell + 1), vectors, True)
+    wY = e3nn.scatter_sum(
+        w[:, :, None] * Y[:, None, :], dst=senders, map_back=True
+    ) / jnp.sqrt(self.avg_num_neighbors)
+    assert wY.shape == (num_edges, V.irreps.mul_gcd, wY.irreps.dim)
+
+    V = e3nn.tensor_product(
+        wY, V.mul_to_axis(), filter_ir_out="0e" + irreps_out
+    ).axis_to_mul()
+
+    if "0e" in V.irreps:
+        x = jnp.concatenate([x, V.filter(keep="0e").array], axis=1)
+        V = V.filter(drop="0e")
+
+    x = MultiLayerPerceptron(
+        (self.mlp_n_hidden,) * self.mlp_n_layers,
+        self.mlp_activation,
+        output_activation=False,
+    )(x)
+    lengths = e3nn.norm(vectors).array
+    x = u(lengths, self.p) * x
+    assert x.shape == (num_edges, self.mlp_n_hidden)
+
+    V = Linear(irreps_out)(V)
+    assert V.shape == (num_edges, V.irreps.dim)
+
+    return (x, V)
+
+
+def allegro_call(
+    Linear,
+    MultiLayerPerceptron,
+    self,
+    node_attrs: jnp.ndarray,  # jax.nn.one_hot(z, num_species)
+    vectors: e3nn.IrrepsArray,  # [n_edges, 3]
+    senders: jnp.ndarray,  # [n_edges]
+    receivers: jnp.ndarray,  # [n_edges]
+    edge_feats: Optional[e3nn.IrrepsArray] = None,  # [n_edges, irreps]
+) -> e3nn.IrrepsArray:
+    num_edges = vectors.shape[0]
+    num_nodes = node_attrs.shape[0]
+    assert vectors.shape == (num_edges, 3)
+    assert node_attrs.shape == (num_nodes, node_attrs.shape[-1])
+    assert senders.shape == (num_edges,)
+    assert receivers.shape == (num_edges,)
+
+    assert vectors.irreps in ["1o", "1e"]
+    irreps = e3nn.Irreps(self.irreps)
+    irreps_out = e3nn.Irreps(self.output_irreps)
+
+    irreps_layers = [irreps] * self.num_layers + [irreps_out]
+    irreps_layers = filter_layers(irreps_layers, self.max_ell)
+
+    vectors = vectors / self.radial_cutoff
+
+    d = e3nn.norm(vectors).array.squeeze(1)
+    x = jnp.concatenate(
+        [
+            normalized_bessel(d, self.n_radial_basis),
+            node_attrs[senders],
+            node_attrs[receivers],
+        ],
+        axis=1,
+    )
+    assert x.shape == (
+        num_edges,
+        self.n_radial_basis + 2 * node_attrs.shape[-1],
+    )
+
+    # Protection against exploding dummy edges:
+    x = jnp.where(d[:, None] == 0.0, 0.0, x)
+
+    x = MultiLayerPerceptron(
+        (
+            self.mlp_n_hidden // 8,
+            self.mlp_n_hidden // 4,
+            self.mlp_n_hidden // 2,
+            self.mlp_n_hidden,
+        ),
+        self.mlp_activation,
+        output_activation=False,
+    )(x)
+    x = u(d, self.p)[:, None] * x
+    assert x.shape == (num_edges, self.mlp_n_hidden)
+
+    irreps_Y = irreps_layers[0].filter(
+        keep=lambda mir: vectors.irreps[0].ir.p ** mir.ir.l == mir.ir.p
+    )
+    V = e3nn.spherical_harmonics(irreps_Y, vectors, True)
+
+    if edge_feats is not None:
+        V = e3nn.concatenate([V, edge_feats])
+    w = MultiLayerPerceptron((V.irreps.num_irreps,), act=None)(x)
+    V = w * V
+    assert V.shape == (num_edges, V.irreps.dim)
+
+    for irreps in irreps_layers[1:]:
+        y, V = allegro_layer_call(
+            Linear,
+            MultiLayerPerceptron,
+            irreps,
+            self,
+            vectors,
+            x,
+            V,
+            senders,
+        )
+
+        alpha = 0.5
+        x = (x + alpha * y) / jnp.sqrt(1 + alpha**2)
+
+    x = MultiLayerPerceptron((128,), act=None)(x)
+
+    xV = Linear(irreps_out)(e3nn.concatenate([x, V]))
+
+    if xV.irreps != irreps_out:
+        raise ValueError(f"output_irreps {irreps_out} is not reachable")
+
+    return xV

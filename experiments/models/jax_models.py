@@ -1,11 +1,15 @@
-from typing import Callable, Optional, Tuple
+from typing import Callable, Optional, Tuple, List
 import jax
 import jax.numpy as jnp
 import haiku as hk
 import jraph
+import e3nn_jax as e3nn
+from jax_md.partition import NeighborList
 
-
-from .jax_layers import GATLayer, EGNNLayer
+from .jax_layers import (
+    GATLayer, EGNNLayer, Interaction, GaussianSmearing, Aggregate, allegro_call
+)
+from utils import shifted_softplus
 
 
 class GAT(hk.Module):
@@ -43,9 +47,9 @@ class GAT(hk.Module):
 
         self.mlp = hk.Sequential([
             hk.Linear(self.dim * self.num_heads, w_init=self.init_fn),
-            lambda x: jax.nn.leaky_relu(x, negative_slope=0.2),
+            jax.nn.relu,
             hk.Linear(self.dim * self.num_heads, w_init=self.init_fn),
-            lambda x: jax.nn.leaky_relu(x, negative_slope=0.2),
+            jax.nn.relu,
             hk.Linear(self.out_dim, w_init=self.init_fn),
         ])
 
@@ -60,8 +64,7 @@ class GAT(hk.Module):
             graph_out = self.gat_layers[i](graph._replace(nodes=x))
 
             # skip connection
-            x = graph_out.nodes + self.skip_connections[i](x)
-            x = jax.nn.leaky_relu(x, negative_slope=0.2)
+            x = jax.nn.relu(graph_out.nodes) + self.skip_connections[i](x)
 
         # global mean pooling
         graph_idx = jnp.repeat(jnp.arange(n_node.shape[0]), n_node, total_repeat_length=sum_n_node)
@@ -168,75 +171,157 @@ class EGNN(hk.Module):
         return h, graph.nodes["pos"]
 
 
-# # Adapted from: https://github.com/google-deepmind/jraph/blob/master/jraph/_src/models.py
-# def GAT_Layer(
-#     num_heads: int,
-#     per_head_channels: int,
-#     attention_query_fn: Callable,
-#     attention_logit_fn: Callable,
-#     node_update_fn: Optional[Callable] = None,
-#     edge_update_fn: Optional[Callable] = None,
-# ):
-#     """Returns a method that applies a Graph Attention Network layer with multi-head attention.
+class SchNet(hk.Module):
+    # n_atom_basis = 128
+    # max_z = 100
+    # n_gaussians = 25
+    #
+    # n_filters = 128
+    #
+    # mean = 0.0
+    # stddev = 20.0
 
-#     This implementation follows the GATv2 approach, similar to GATv2Conv in PyTorch Geometric.
+    # config_atomwise = {'n_in': 128, 'mean': 0.0, 'stddev': 20.0, 'n_layers': 2, 'n_neurons': None}
 
-#     Args:
-#       num_heads: Number of attention heads.
-#       per_head_channels: Number of output channels per attention head.
-#       attention_query_fn: function that generates linear transformations for each head.
-#       attention_logit_fn: function that computes attention logits.
-#       node_update_fn: function that updates the aggregated messages. If None,
-#         will concatenate the multi-head outputs (or average if concat=False).
-#       edge_update_fn: Optional function to update edge features (not used in this implementation).
+    def __init__(
+        self,
+        n_atom_basis: int,
+        max_z: int,
+        n_gaussians: int,
+        n_filters: int,
+        mean: float,
+        stddev: float,
+        r_cutoff: float,
+        n_interactions: int,
+        normalize_filter: bool,
+        per_atom: bool,
+    ):
 
-#     Returns:
-#       A function that applies a multi-head Graph Attention layer.
-#     """
-#     if node_update_fn is None:
-#         node_update_fn = (
-#             lambda x: x
-#         )  # Identity function, as concatenation is done internally
+        self.n_atom_basis = n_atom_basis
+        self.max_z = max_z
+        self.n_gaussians = n_gaussians
+        self.n_filters = n_filters
+        self.mean = mean
+        self.stddev = stddev
 
-#     def _ApplyGAT(graph):
-#         """Applies a multi-head Graph Attention layer."""
-#         nodes, edges, receivers, senders, _, _, _ = graph
-#         sum_n_node = nodes.shape[0]
+        super().__init__(name="SchNet")
+        self.n_interactions = n_interactions
+        self.per_atom = per_atom
 
-#         # Linear transformation for each head
-#         nodes_transformed = attention_query_fn(nodes)
-#         nodes_transformed = nodes_transformed.reshape(
-#             -1, num_heads, per_head_channels
-#         )
+        self.embedding = hk.Embed(
+            self.max_z, self.n_atom_basis, name="embeddings"
+        )
+        self.distance_expansion = GaussianSmearing(
+            0.0, r_cutoff, self.n_gaussians
+        )
 
-#         # Compute attention logits
-#         sent_attributes = nodes_transformed[senders]
-#         received_attributes = nodes_transformed[receivers]
-#         attention_logits = attention_logit_fn(
-#             sent_attributes, received_attributes
-#         )
+        self.interactions = hk.Sequential(
+            [
+                Interaction(
+                    idx=i,
+                    n_atom_basis=self.n_atom_basis,
+                    n_filters=self.n_filters,
+                    n_spatial_basis=self.n_gaussians,
+                    r_cutoff=r_cutoff,
+                    normalize_filter=normalize_filter,
+                )
+                for i in range(self.n_interactions)
+            ]
+        )
 
-#         # Apply softmax to get attention coefficients
-#         alpha = jraph.segment_softmax(
-#             attention_logits, segment_ids=receivers, num_segments=sum_n_node
-#         )
+        self.atomwise = hk.nets.MLP(
+            output_sizes=[64, 1], activation=shifted_softplus, name="atomwise"
+        )
+        self.aggregate = Aggregate(axis=0, mean_pooling=False)
 
-#         # Apply attention coefficients
-#         out = sent_attributes * alpha
+    @staticmethod
+    def standardize(yi: jnp.ndarray, mean: float, stddev: float):
+        return yi * stddev + mean
 
-#         # Aggregate messages
-#         out = jraph.segment_sum(
-#             out, segment_ids=receivers, num_segments=sum_n_node
-#         )
+    def __call__(
+        self,
+        dR: jnp.ndarray,
+        Z: jnp.ndarray,
+        neighbors: NeighborList,
+        *args,
+        **kwargs,
+    ) -> jnp.ndarray:
+        # TODO: Move hk.set_state() calls into layer modules. Use self.name as key.
 
-#         # Concatenate or average the multi-head results
-#         out = out.reshape(sum_n_node, -1)  # Concatenate by default
-#         # If you want to average instead, use:
-#         # out = out.mean(axis=1)
+        # get embedding for Z
+        x = self.embedding(Z)
+        hk.set_state("embedding", x)
 
-#         # Apply final update function
-#         nodes = node_update_fn(out)
+        # expand interatomic distances
+        dR_expanded = self.distance_expansion(dR)
+        # hk.set_state("distance_expansion", dR_expanded)
 
-#         return graph._replace(nodes=nodes)
+        # compute interactions
+        for i, interaction in enumerate(self.interactions.layers):
+            v = interaction(x, dR, neighbors, dR_expanded)
+            x = x + v
 
-#     return _ApplyGAT
+        # energy contributions
+        yi = self.atomwise(x)
+        yi = self.standardize(yi, self.mean, self.stddev)
+
+        if self.per_atom:
+            return jnp.squeeze(yi)
+
+        y = self.aggregate(yi)
+        return jnp.squeeze(y)
+
+
+### Allegro ###
+
+
+
+
+class AllegroHaiku(hk.Module):
+
+    def __init__(
+        self,
+        avg_num_neighbors: float,
+        max_ell: int = 3,
+        irreps: e3nn.Irreps = 128
+        * e3nn.Irreps("0o + 1o + 1e + 2e + 2o + 3o + 3e"),
+        mlp_activation: Callable[[jnp.ndarray], jnp.ndarray] = jax.nn.silu,
+        mlp_n_hidden: int = 1024,
+        mlp_n_layers: int = 3,
+        p: int = 6,
+        n_radial_basis: int = 8,
+        radial_cutoff: float = 1.0,
+        output_irreps: e3nn.Irreps = e3nn.Irreps("0e"),
+        num_layers: int = 3,
+    ):
+        super().__init__()
+        self.avg_num_neighbors = avg_num_neighbors
+        self.max_ell = max_ell
+        self.irreps = irreps
+        self.mlp_activation = mlp_activation
+        self.mlp_n_hidden = mlp_n_hidden
+        self.mlp_n_layers = mlp_n_layers
+        self.p = p
+        self.n_radial_basis = n_radial_basis
+        self.radial_cutoff = radial_cutoff
+        self.output_irreps = output_irreps
+        self.num_layers = num_layers
+
+    def __call__(
+        self,
+        node_attrs: jnp.ndarray,  # jax.nn.one_hot(z, num_species)
+        vectors: e3nn.IrrepsArray,  # [n_edges, 3]
+        senders: jnp.ndarray,  # [n_edges]
+        receivers: jnp.ndarray,  # [n_edges]
+        edge_feats: Optional[e3nn.IrrepsArray] = None,  # [n_edges, irreps]
+    ) -> e3nn.IrrepsArray:
+        return allegro_call(
+            e3nn.haiku.Linear,
+            e3nn.haiku.MultiLayerPerceptron,
+            self,
+            node_attrs,
+            vectors,
+            senders,
+            receivers,
+            edge_feats,
+        )

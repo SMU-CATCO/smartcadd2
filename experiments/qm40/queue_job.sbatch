@@ -1,5 +1,6 @@
 #!/usr/bin/env zsh
 #SBATCH -J qm40
+#SBATCH -A ekraka_drugdesign_0001
 #SBATCH -o output/qm40_%j.out
 #SBATCH -c 128 --mem=120G     
 #SBATCH --nodes=1

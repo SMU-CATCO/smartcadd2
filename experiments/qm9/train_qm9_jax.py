@@ -15,6 +15,8 @@ import torch_geometric.transforms as T
 from torch_geometric.loader import DataLoader
 from functools import partial
 
+# jax.disable_jit()
+
 # Add the parent directory of the current file to the Python path
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
@@ -63,7 +65,7 @@ def parse_args():
         "--lr", type=float, default=0.001, help="Learning rate"
     )
     parser.add_argument(
-        "--min_lr", type=float, default=0.0001, help="Minimum learning rate"
+        "--min_lr", type=float, default=0.00001, help="Minimum learning rate"
     )
     parser.add_argument(
         "--epochs", type=int, default=300, help="Number of epochs"
@@ -204,15 +206,12 @@ def train(args, model, train_loader, val_loader, test_loader, std, max_nodes, ma
 
     params = model.init(rng, graph_init)
 
-    optimizer = optax.chain(
-        optax.clip_by_global_norm(3.0),  
-        optax.adam(learning_rate=args.lr)
-    )
+    optimizer = optax.adam(learning_rate=args.lr)
     opt_state = optimizer.init(params)
 
     min_lr = args.min_lr
     scheduler = optax.contrib.reduce_on_plateau(
-        patience=10,
+        patience=5,
         factor=0.7,
         rtol=0.0001,
         min_scale=min_lr / args.lr
@@ -246,6 +245,7 @@ def train(args, model, train_loader, val_loader, test_loader, std, max_nodes, ma
                 model_fn
             )
             epoch_loss += loss
+            print(f"Loss: {loss:.7f}", flush=True)
 
         epoch_loss /= len(train_loader)
 
