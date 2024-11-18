@@ -17,3 +17,9 @@ def normalized_bessel(d: jnp.ndarray, n: int) -> jnp.ndarray:
 
 def u(d: jnp.ndarray, p: int) -> jnp.ndarray:
     return e3nn.poly_envelope(p - 1, 2)(d)
+
+def cosine_cutoff(dR: jnp.ndarray, r_cutoff: float) -> jnp.ndarray:
+    r_cutoff = jnp.float32(r_cutoff)
+    cutoffs = 0.5 * (jnp.cos(dR * jnp.pi / r_cutoff) + 1.0)
+    cutoffs *= dR < r_cutoff
+    return cutoffs

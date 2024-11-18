@@ -22,7 +22,7 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
 sys.path.insert(0, parent_dir)
 
-from models import GAT, EGNN
+from models import *
 from data_loaders import qmx_batch_to_jraph, pad_graph_to_max_size
 import utils
 
@@ -141,7 +141,7 @@ def load_and_preprocess_data(args):
     return train_loader, val_loader, test_loader, float(std), max_nodes, max_edges
 
 
-def create_model(model_name, dim, heads, concat):
+def create_model(model_name, dim, heads, concat=True):
     net_fn = None
     if model_name == "GAT":
         net_fn = lambda graph: GAT(
@@ -151,6 +151,11 @@ def create_model(model_name, dim, heads, concat):
     elif model_name == "EGNN":
         net_fn = lambda graph: EGNN(
             hidden_size=dim, output_size=1, num_layers=3
+        )(graph)
+    
+    elif model_name == "SchNet":
+        net_fn = lambda graph: SchNet(
+            n_atom_basis=dim, max_z=9, n_gaussians=25, n_filters=dim, mean=0.0, stddev=20.0, r_cutoff=5.0, n_interactions=2, per_atom=True
         )(graph)
 
     return hk.without_apply_rng(hk.transform(net_fn))

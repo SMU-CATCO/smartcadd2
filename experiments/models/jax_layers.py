@@ -5,13 +5,13 @@ import jax
 import jax.numpy as jnp
 from jax.tree_util import Partial
 import jax.tree_util as tree
-from jax_md.partition import NeighborList
+# from jax_md.partition import NeighborList
 import haiku as hk
 import jraph
 import e3nn_jax as e3nn
 
 
-from utils import shifted_softplus, normalized_bessel, u
+from .model_utils import shifted_softplus, normalized_bessel, u, cosine_cutoff
 
 class GATLayer(hk.Module):
     """Implements GATv2Layer"""
@@ -403,48 +403,7 @@ class GraphNetwork(hk.Module):
 
         return graph._replace(nodes=nodes, edges=edges, globals=globals_)
 
-### SchNet Layers ###
-
-
-class Aggregate(hk.Module):
-    """Pooling layer based on sum or average with optional masking.
-
-    Args:
-        axis (int): axis along which pooling is done.
-        mean_pooling (bool, optional): if True, use average instead for sum pooling.
-        keepdim (bool, optional): whether the output tensor has dim retained or not.
-
-    """
-
-    def __init__(self, axis: int, mean_pooling=False, keepdim=True):
-        super().__init__(name="Aggregate")
-        self.axis = axis
-        self.mean_pooling = mean_pooling
-        self.keepdim = keepdim
-
-    def __call__(self, input: jnp.ndarray, mask=None):
-        # mask input
-        if mask is not None:
-            input = input * mask[..., None]
-
-        # compute sum of input along axis
-        y = jnp.sum(input, self.axis)
-
-        # compute average of input along axis
-        if self.mean_pooling:
-
-            # get the number of items along axis
-            if mask is not None:
-                N = jnp.sum(mask, self.axis, keepdim=self.keepdim)
-                N = jnp.max(N, other=jnp.ones_like(N))
-
-            else:
-                # N = input.size(self.axis)
-                N = input.shape(self.axis)
-
-            y = y / N
-
-        return y
+### SchNet Layers from https://github.com/fabiannagel/schnax ###
 
 
 class FilterNetwork(hk.Module):
@@ -460,27 +419,8 @@ class FilterNetwork(hk.Module):
 
     def __call__(self, x: jnp.ndarray):
         x = self.linear_0(x)
-        hk.set_state(
-            self.linear_0.layers[0].name, x
-        )  # w/o referencing layer 0, the key would be "Sequential".
-
         x = self.linear_1(x)
-        hk.set_state(self.linear_1.name, x)
-
         return x
-
-
-class CosineCutoff(hk.Module):
-
-    def __init__(self, r_cutoff: float):
-        super().__init__(name="CosineCutoff")
-        self.r_cutoff = jnp.float32(r_cutoff)
-
-    def __call__(self, dR: jnp.ndarray) -> jnp.ndarray:
-        cutoffs = 0.5 * (jnp.cos(dR * jnp.pi / self.r_cutoff) + 1.0)
-        cutoffs *= dR < self.r_cutoff
-        hk.set_state(self.name, cutoffs)
-        return cutoffs
 
 
 class CFConv(hk.Module):
@@ -491,79 +431,50 @@ class CFConv(hk.Module):
         n_out: int,
         r_cutoff: float,
         activation,
-        normalize_filter=False,
-        axis=1,
+
     ):
         super().__init__(name="CFConv")
 
         self.filter_network = FilterNetwork(n_filters)
-        self.cutoff_network = CosineCutoff(r_cutoff)
+        self.cutoff_network = lambda dR: cosine_cutoff(dR, r_cutoff)
 
         self.in2f = hk.Linear(n_filters, with_bias=False, name="in2f")
         self.f2out = hk.Sequential(
             [hk.Linear(n_out, with_bias=True, name="f2out"), activation]
         )
 
-        self.aggregate = Aggregate(axis=axis, mean_pooling=normalize_filter)
-
-    @staticmethod
-    def _reshape_y(y: jnp.ndarray, neighbors: NeighborList) -> jnp.ndarray:
-        nbh_size = neighbors.idx.shape
-
-        # use SchNetPack's 0-padding approach to obtain *exactly* the same results after this reshaping operation.
-        nbh_indices = neighbors.idx
-        # padding_mask = nbh_indices == nbh_indices.shape[0]
-        # nbh_indices[padding_mask] = 0
-
-        # (n_atoms, max_occupancy) -> (n_atoms * max_occupancy, 1)
-        # for batches, use shape (-1, nbh_size[1] * nbh_size[2], 1)
-        nbh = nbh_indices.reshape((nbh_size[0] * nbh_size[1], 1))
-
-        # (n_atoms * max_occupancy, 1) -> (n_atoms * max_occupancy, n_filters)
-        nbh = jnp.tile(nbh, (1, y.shape[1]))
-
-        # (n_atoms, n_filters) -> (n_atoms * max_occupancy, n_filters)
-        y = jnp.take_along_axis(y, indices=nbh, axis=0)
-
-        # (n_atoms * max_occupancy, n_filters) -> (n_atoms, max_occupancy, n_filters)
-        y = jnp.reshape(y, (nbh_size[0], nbh_size[1], -1))
-        return y
-
     def __call__(
         self,
         x: jnp.ndarray,
         dR: jnp.ndarray,
-        neighbors: NeighborList,
+        senders: jnp.ndarray,
+        receivers: jnp.ndarray,
         dR_expanded: jnp.ndarray,
     ):
-        if dR_expanded is None:
-            # Insert a new dimension (size 1) at the last position
-            # (n_atoms, max_occupancy) -> (n_atoms, max_occupancy, 1)
-            dR_expanded = jnp.expand_dims(dR, axis=-1)
+        sum_n_node = x.shape[0]
 
         # pass expanded interactomic distances through filter block
-        W = self.filter_network(dR_expanded)
+        if dR_expanded.ndim == 3:
+            W = self.filter_network(dR_expanded).squeeze(1)
+        else:
+            W = self.filter_network(dR_expanded)
 
         # apply cutoff
         if self.cutoff_network is not None:
             C = self.cutoff_network(dR)
-            W = W * jnp.expand_dims(C, axis=-1)
+            W = W * C #jnp.expand_dims(C, axis=-1)
 
         # pass initial embeddings through dense layer. reshape y for element-wise multiplication by W.
         y = self.in2f(x)
-        hk.set_state(self.in2f.name, y)
-        y = self._reshape_y(y, neighbors)
+        y = y[receivers]
 
         # element-wise multiplication, aggregation and dense output layer.
         y = y * W
 
         # aggregate over neighborhoods, skip padded indices.
-        actual_indices_mask = neighbors.idx != neighbors.idx.shape[0]
-        y = self.aggregate(y, actual_indices_mask)
-        hk.set_state(self.aggregate.name, y)
+        y = jraph.segment_sum(y, segment_ids=receivers, num_segments=sum_n_node)
 
         y = self.f2out(y)
-        hk.set_state(self.f2out.layers[0].name, y)
 
         return y
 
@@ -574,17 +485,15 @@ class Interaction(hk.Module):
         idx: int,
         n_atom_basis: int,
         n_filters: int,
-        n_spatial_basis: int,
         r_cutoff: float,
-        normalize_filter: bool,
     ):
         super().__init__(name="Interaction_{}".format(idx))
+
         self.cfconv = CFConv(
             n_filters,
             n_atom_basis,
             r_cutoff,
             activation=shifted_softplus,
-            normalize_filter=normalize_filter,
         )
         self.dense = hk.Linear(n_atom_basis, name="Output")
 
@@ -592,7 +501,8 @@ class Interaction(hk.Module):
         self,
         x: jnp.ndarray,
         dR: jnp.ndarray,
-        neighbors: NeighborList,
+        senders: jnp.ndarray,
+        receivers: jnp.ndarray,
         dR_expanded=None,
     ):
         """Compute convolution block.
@@ -609,9 +519,8 @@ class Interaction(hk.Module):
             jnp.ndarray: block output with (N_a, n_out) shape.
 
         """
-        x = self.cfconv(x, dR, neighbors, dR_expanded)
+        x = self.cfconv(x, dR, senders, receivers, dR_expanded)
         x = self.dense(x)
-        hk.set_state(self.dense.name, x)
         return x
 
 
@@ -629,7 +538,6 @@ class GaussianSmearing(hk.Module):
         self.widths = (self.offset[1] - self.offset[0]) * jnp.ones_like(
             self.offset
         )
-        # TODO: trainable
         self.centered = centered
 
     def _smearing(self, distances: jnp.ndarray) -> jnp.ndarray:
@@ -656,7 +564,6 @@ class GaussianSmearing(hk.Module):
 
     def __call__(self, distances: jnp.ndarray, *args, **kwargs):
         smearing = self._smearing(distances)
-        hk.set_state(self.name, smearing)
         return smearing
 
 
