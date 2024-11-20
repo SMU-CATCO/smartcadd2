@@ -3,75 +3,14 @@ import jax
 import jax.numpy as jnp
 import haiku as hk
 import jraph
-import e3nn_jax as e3nn
-# from jax_md.partition import NeighborLists
+# import e3nn_jax as e3nn
+
 
 from .jax_layers import (
-    GATLayer, EGNNLayer, Interaction, GaussianSmearing, allegro_call
+    EGNNLayer, Interaction, GaussianSmearing, #allegro_call
 )
 from .model_utils import shifted_softplus
 
-
-class GAT(hk.Module):
-    def __init__(
-        self,
-        dim,
-        out_dim,
-        num_heads,
-        num_layers,
-        concat=True,
-        name="GAT",
-    ):
-        super().__init__(name=name)
-        self.dim = dim
-        self.out_dim = out_dim
-        self.num_heads = num_heads
-        self.num_layers = num_layers
-        self.concat = concat
-
-        self.init_fn = hk.initializers.VarianceScaling(
-            scale=1.0, mode="fan_avg", distribution="uniform"
-        )
-
-        self.input_layer = lambda x: jax.nn.relu(hk.Linear(dim, w_init=self.init_fn)(x))
-
-        self.gat_layers = [GATLayer(self.dim, self.num_heads, self.concat, name=f"gat_layer_0")]
-        for i in range(1, self.num_layers):
-            self.gat_layers.append(GATLayer(self.dim * self.num_heads, num_heads=1, concat=False, name=f"gat_layer_{i}"))
-
-
-        self.skip_connections = [
-            hk.Linear(self.dim * self.num_heads, w_init=self.init_fn, name=f"skip_connection_{i}")
-            for i in range(self.num_layers)
-        ]
-
-        self.mlp = hk.Sequential([
-            hk.Linear(self.dim * self.num_heads, w_init=self.init_fn),
-            jax.nn.relu,
-            hk.Linear(self.dim * self.num_heads, w_init=self.init_fn),
-            jax.nn.relu,
-            hk.Linear(self.out_dim, w_init=self.init_fn),
-        ])
-
-    def __call__(self, graph):
-        nodes, _, _, _, _, n_node, _ = graph
-        nodes = nodes["x"]
-        sum_n_node = jax.tree_util.tree_leaves(nodes)[0].shape[0]
-
-        x = self.input_layer(nodes)
-
-        for i in range(self.num_layers):
-            graph_out = self.gat_layers[i](graph._replace(nodes=x))
-
-            # skip connection
-            x = jax.nn.relu(graph_out.nodes) + self.skip_connections[i](x)
-
-        # global mean pooling
-        graph_idx = jnp.repeat(jnp.arange(n_node.shape[0]), n_node, total_repeat_length=sum_n_node)
-        x = jraph.segment_mean(x, segment_ids=graph_idx, num_segments=n_node.shape[0])
-
-        # final mlp
-        return self.mlp(x).reshape(-1)
 
 # Adapted from https://github.com/gerkone/egnn-jax/blob/main/egnn_jax/egnn.py
 class EGNN(hk.Module):
@@ -172,28 +111,19 @@ class EGNN(hk.Module):
 
 
 class SchNet(hk.Module):
-    # n_atom_basis = 128
-    # max_z = 100
-    # n_gaussians = 25
-    #
-    # n_filters = 128
-    #
-    # mean = 0.0
-    # stddev = 20.0
-
-    # config_atomwise = {'n_in': 128, 'mean': 0.0, 'stddev': 20.0, 'n_layers': 2, 'n_neurons': None}
 
     def __init__(
         self,
         n_atom_basis: int,
         max_z: int,
+        n_interactions: int,
         n_gaussians: int,
         n_filters: int,
-        mean: float,
-        stddev: float,
-        r_cutoff: float,
-        n_interactions: int,
-        per_atom: bool,
+        r_cutoff: float = 6.0,
+        mean: float = 0.0,
+        stddev: float = 1.0,
+        per_atom: bool = False,
+        aggr_type: str = "sum",
     ):
 
         self.n_atom_basis = n_atom_basis
@@ -202,7 +132,7 @@ class SchNet(hk.Module):
         self.n_filters = n_filters
         self.mean = mean
         self.stddev = stddev
-
+        self.aggr_type = aggr_type
         super().__init__(name="SchNet")
         self.n_interactions = n_interactions
         self.per_atom = per_atom
@@ -234,14 +164,12 @@ class SchNet(hk.Module):
     def standardize(yi: jnp.ndarray, mean: float, stddev: float):
         return yi * stddev + mean
 
-
     def __call__(self, graph: jraph.GraphsTuple) -> jnp.ndarray:
         # Extract node and edge features
         atoms = graph.nodes["z"]
         senders = graph.senders
         receivers = graph.receivers
         dR = graph.edges["edge_attr"]
-        sum_n_node = jax.tree_util.tree_leaves(graph.nodes)[0].shape[0]
 
         # Get embedding for atomic numbers
         x = self.embedding(atoms)
@@ -257,61 +185,67 @@ class SchNet(hk.Module):
         yi = self.atomwise(x)
         yi = self.standardize(yi, self.mean, self.stddev)
 
-        if self.per_atom:
-            return jnp.squeeze(yi)
+        # mask padded nodes
+        mask = jraph.get_node_padding_mask(graph)
+        yi = jnp.squeeze(yi) * mask
 
-        y = jraph.segment_sum(yi, segment_ids=receivers, num_segments=sum_n_node)
-        return jnp.squeeze(y)
+        if self.per_atom:
+            return yi
+
+        if self.aggr_type == "sum":
+            return jnp.sum(yi, axis=0)
+        elif self.aggr_type == "mean":
+            return jnp.mean(yi, axis=0)
 
 
 ### Allegro ###
 
 
-class AllegroHaiku(hk.Module):
+# class AllegroHaiku(hk.Module):
 
-    def __init__(
-        self,
-        avg_num_neighbors: float,
-        max_ell: int = 3,
-        irreps: e3nn.Irreps = 128
-        * e3nn.Irreps("0o + 1o + 1e + 2e + 2o + 3o + 3e"),
-        mlp_activation: Callable[[jnp.ndarray], jnp.ndarray] = jax.nn.silu,
-        mlp_n_hidden: int = 1024,
-        mlp_n_layers: int = 3,
-        p: int = 6,
-        n_radial_basis: int = 8,
-        radial_cutoff: float = 1.0,
-        output_irreps: e3nn.Irreps = e3nn.Irreps("0e"),
-        num_layers: int = 3,
-    ):
-        super().__init__()
-        self.avg_num_neighbors = avg_num_neighbors
-        self.max_ell = max_ell
-        self.irreps = irreps
-        self.mlp_activation = mlp_activation
-        self.mlp_n_hidden = mlp_n_hidden
-        self.mlp_n_layers = mlp_n_layers
-        self.p = p
-        self.n_radial_basis = n_radial_basis
-        self.radial_cutoff = radial_cutoff
-        self.output_irreps = output_irreps
-        self.num_layers = num_layers
+#     def __init__(
+#         self,
+#         avg_num_neighbors: float,
+#         max_ell: int = 3,
+#         irreps: e3nn.Irreps = 128
+#         * e3nn.Irreps("0o + 1o + 1e + 2e + 2o + 3o + 3e"),
+#         mlp_activation: Callable[[jnp.ndarray], jnp.ndarray] = jax.nn.silu,
+#         mlp_n_hidden: int = 1024,
+#         mlp_n_layers: int = 3,
+#         p: int = 6,
+#         n_radial_basis: int = 8,
+#         radial_cutoff: float = 1.0,
+#         output_irreps: e3nn.Irreps = e3nn.Irreps("0e"),
+#         num_layers: int = 3,
+#     ):
+#         super().__init__()
+#         self.avg_num_neighbors = avg_num_neighbors
+#         self.max_ell = max_ell
+#         self.irreps = irreps
+#         self.mlp_activation = mlp_activation
+#         self.mlp_n_hidden = mlp_n_hidden
+#         self.mlp_n_layers = mlp_n_layers
+#         self.p = p
+#         self.n_radial_basis = n_radial_basis
+#         self.radial_cutoff = radial_cutoff
+#         self.output_irreps = output_irreps
+#         self.num_layers = num_layers
 
-    def __call__(
-        self,
-        node_attrs: jnp.ndarray,  # jax.nn.one_hot(z, num_species)
-        vectors: e3nn.IrrepsArray,  # [n_edges, 3]
-        senders: jnp.ndarray,  # [n_edges]
-        receivers: jnp.ndarray,  # [n_edges]
-        edge_feats: Optional[e3nn.IrrepsArray] = None,  # [n_edges, irreps]
-    ) -> e3nn.IrrepsArray:
-        return allegro_call(
-            e3nn.haiku.Linear,
-            e3nn.haiku.MultiLayerPerceptron,
-            self,
-            node_attrs,
-            vectors,
-            senders,
-            receivers,
-            edge_feats,
-        )
+#     def __call__(
+#         self,
+#         node_attrs: jnp.ndarray,  # jax.nn.one_hot(z, num_species)
+#         vectors: e3nn.IrrepsArray,  # [n_edges, 3]
+#         senders: jnp.ndarray,  # [n_edges]
+#         receivers: jnp.ndarray,  # [n_edges]
+#         edge_feats: Optional[e3nn.IrrepsArray] = None,  # [n_edges, irreps]
+#     ) -> e3nn.IrrepsArray:
+#         return allegro_call(
+#             e3nn.haiku.Linear,
+#             e3nn.haiku.MultiLayerPerceptron,
+#             self,
+#             node_attrs,
+#             vectors,
+#             senders,
+#             receivers,
+#             edge_feats,
+#         )

@@ -5,100 +5,15 @@ import jax
 import jax.numpy as jnp
 from jax.tree_util import Partial
 import jax.tree_util as tree
-# from jax_md.partition import NeighborList
 import haiku as hk
 import jraph
-import e3nn_jax as e3nn
+# import e3nn_jax as e3nn
 
 
-from .model_utils import shifted_softplus, normalized_bessel, u, cosine_cutoff
-
-class GATLayer(hk.Module):
-    """Implements GATv2Layer"""
-    def __init__(
-        self,
-        dim,
-        num_heads,
-        concat=True,
-        share_weights=False,
-        name=None,
-    ):
-        super().__init__(name=name)
-        self.dim = dim
-        self.num_heads = num_heads
-        self.concat = concat
-        self.share_weights = share_weights
-        self.init_fn = hk.initializers.VarianceScaling(
-            scale=1.0, mode="fan_avg", distribution="uniform"
-        )
-
-        # node update function
-        self.node_update_fn = lambda x: x 
-
-        # query functions
-        self.attention_query_l = hk.Linear(
-            dim * num_heads, w_init=self.init_fn, name="attention_query_l"
-        )
-
-        self.attention_query_r = (
-            self.attention_query_l
-            if self.share_weights
-            else hk.Linear(
-                dim * num_heads, w_init=self.init_fn, name="attention_query_r"
-            )
-        )
-
-        self.attention_logit_fn = lambda q, k: hk.Linear(
-            1, w_init=self.init_fn, name="attention_logit_fn"
-        )(
-            jax.nn.leaky_relu(q + k, negative_slope=0.2)
-        )
-
-    def __call__(self, graph):
-        nodes, _, receivers, senders, _, _, _ = graph
-        sum_n_node = tree.tree_leaves(nodes)[0].shape[0]
-
-        # Linear transformation 
-        nodes_transformed_l = self.attention_query_l(nodes).reshape(
-            -1, self.num_heads, self.dim
-        )
-        if not self.share_weights:
-            nodes_transformed_r = self.attention_query_r(nodes).reshape(
-                -1, self.num_heads, self.dim
-            )
-        else:
-            nodes_transformed_r = nodes_transformed_l
-
-        # Compute attention logits
-        sent_attributes = nodes_transformed_l[senders]
-        received_attributes = nodes_transformed_r[receivers]
-        attention_logits = self.attention_logit_fn(
-            sent_attributes, received_attributes
-        )
-
-        # Apply softmax to get attention coefficients
-        alpha = jraph.segment_softmax(
-            attention_logits, segment_ids=receivers, num_segments=sum_n_node
-        )
-
-        # Apply attention coefficients
-        out = sent_attributes * alpha
-
-        # Aggregate messages
-        out = jraph.segment_sum(
-            out, segment_ids=receivers, num_segments=sum_n_node
-        )
-
-        # # Concatenate or average the multi-head results
-        if self.concat:
-            out = out.reshape(sum_n_node, self.dim * self.num_heads)
-        else:
-            out = jnp.mean(out, axis=1)
-
-        # Apply final update function
-        nodes = self.node_update_fn(out)
-
-        return graph._replace(nodes=nodes)
+from .model_utils import (
+    shifted_softplus,
+    cosine_cutoff,
+)  # , normalized_bessel, u
 
 
 # Adapted from https://github.com/gerkone/egnn-jax/blob/main/egnn_jax/egnn.py
@@ -570,158 +485,158 @@ class GaussianSmearing(hk.Module):
 ### Allegro Layers ###
 
 
-def filter_layers(
-    layer_irreps: List[e3nn.Irreps], max_ell: int
-) -> List[e3nn.Irreps]:
-    layer_irreps = list(layer_irreps)
-    filtered = [e3nn.Irreps(layer_irreps[-1])]
-    for irreps in reversed(layer_irreps[:-1]):
-        irreps = e3nn.Irreps(irreps)
-        irreps = irreps.filter(
-            keep=e3nn.tensor_product(
-                filtered[0],
-                e3nn.Irreps.spherical_harmonics(lmax=max_ell),
-            ).regroup()
-        )
-        filtered.insert(0, irreps)
-    return filtered
+# def filter_layers(
+#     layer_irreps: List[e3nn.Irreps], max_ell: int
+# ) -> List[e3nn.Irreps]:
+#     layer_irreps = list(layer_irreps)
+#     filtered = [e3nn.Irreps(layer_irreps[-1])]
+#     for irreps in reversed(layer_irreps[:-1]):
+#         irreps = e3nn.Irreps(irreps)
+#         irreps = irreps.filter(
+#             keep=e3nn.tensor_product(
+#                 filtered[0],
+#                 e3nn.Irreps.spherical_harmonics(lmax=max_ell),
+#             ).regroup()
+#         )
+#         filtered.insert(0, irreps)
+#     return filtered
 
 
-def allegro_layer_call(
-    Linear,
-    MultiLayerPerceptron,
-    output_irreps: e3nn.Irreps,
-    self,
-    vectors: e3nn.IrrepsArray,  # [n_edges, 3]
-    x: jnp.ndarray,  # [n_edges, features]
-    V: e3nn.IrrepsArray,  # [n_edges, irreps]
-    senders: jnp.ndarray,  # [n_edges]
-) -> e3nn.IrrepsArray:
-    num_edges = vectors.shape[0]
-    assert vectors.shape == (num_edges, 3)
-    assert x.shape == (num_edges, x.shape[-1])
-    assert V.shape == (num_edges, V.irreps.dim)
-    assert senders.shape == (num_edges,)
+# def allegro_layer_call(
+#     Linear,
+#     MultiLayerPerceptron,
+#     output_irreps: e3nn.Irreps,
+#     self,
+#     vectors: e3nn.IrrepsArray,  # [n_edges, 3]
+#     x: jnp.ndarray,  # [n_edges, features]
+#     V: e3nn.IrrepsArray,  # [n_edges, irreps]
+#     senders: jnp.ndarray,  # [n_edges]
+# ) -> e3nn.IrrepsArray:
+#     num_edges = vectors.shape[0]
+#     assert vectors.shape == (num_edges, 3)
+#     assert x.shape == (num_edges, x.shape[-1])
+#     assert V.shape == (num_edges, V.irreps.dim)
+#     assert senders.shape == (num_edges,)
 
-    irreps_out = e3nn.Irreps(output_irreps)
+#     irreps_out = e3nn.Irreps(output_irreps)
 
-    w = MultiLayerPerceptron((V.irreps.mul_gcd,), act=None)(x)
-    Y = e3nn.spherical_harmonics(range(self.max_ell + 1), vectors, True)
-    wY = e3nn.scatter_sum(
-        w[:, :, None] * Y[:, None, :], dst=senders, map_back=True
-    ) / jnp.sqrt(self.avg_num_neighbors)
-    assert wY.shape == (num_edges, V.irreps.mul_gcd, wY.irreps.dim)
+#     w = MultiLayerPerceptron((V.irreps.mul_gcd,), act=None)(x)
+#     Y = e3nn.spherical_harmonics(range(self.max_ell + 1), vectors, True)
+#     wY = e3nn.scatter_sum(
+#         w[:, :, None] * Y[:, None, :], dst=senders, map_back=True
+#     ) / jnp.sqrt(self.avg_num_neighbors)
+#     assert wY.shape == (num_edges, V.irreps.mul_gcd, wY.irreps.dim)
 
-    V = e3nn.tensor_product(
-        wY, V.mul_to_axis(), filter_ir_out="0e" + irreps_out
-    ).axis_to_mul()
+#     V = e3nn.tensor_product(
+#         wY, V.mul_to_axis(), filter_ir_out="0e" + irreps_out
+#     ).axis_to_mul()
 
-    if "0e" in V.irreps:
-        x = jnp.concatenate([x, V.filter(keep="0e").array], axis=1)
-        V = V.filter(drop="0e")
+#     if "0e" in V.irreps:
+#         x = jnp.concatenate([x, V.filter(keep="0e").array], axis=1)
+#         V = V.filter(drop="0e")
 
-    x = MultiLayerPerceptron(
-        (self.mlp_n_hidden,) * self.mlp_n_layers,
-        self.mlp_activation,
-        output_activation=False,
-    )(x)
-    lengths = e3nn.norm(vectors).array
-    x = u(lengths, self.p) * x
-    assert x.shape == (num_edges, self.mlp_n_hidden)
+#     x = MultiLayerPerceptron(
+#         (self.mlp_n_hidden,) * self.mlp_n_layers,
+#         self.mlp_activation,
+#         output_activation=False,
+#     )(x)
+#     lengths = e3nn.norm(vectors).array
+#     x = u(lengths, self.p) * x
+#     assert x.shape == (num_edges, self.mlp_n_hidden)
 
-    V = Linear(irreps_out)(V)
-    assert V.shape == (num_edges, V.irreps.dim)
+#     V = Linear(irreps_out)(V)
+#     assert V.shape == (num_edges, V.irreps.dim)
 
-    return (x, V)
+#     return (x, V)
 
 
-def allegro_call(
-    Linear,
-    MultiLayerPerceptron,
-    self,
-    node_attrs: jnp.ndarray,  # jax.nn.one_hot(z, num_species)
-    vectors: e3nn.IrrepsArray,  # [n_edges, 3]
-    senders: jnp.ndarray,  # [n_edges]
-    receivers: jnp.ndarray,  # [n_edges]
-    edge_feats: Optional[e3nn.IrrepsArray] = None,  # [n_edges, irreps]
-) -> e3nn.IrrepsArray:
-    num_edges = vectors.shape[0]
-    num_nodes = node_attrs.shape[0]
-    assert vectors.shape == (num_edges, 3)
-    assert node_attrs.shape == (num_nodes, node_attrs.shape[-1])
-    assert senders.shape == (num_edges,)
-    assert receivers.shape == (num_edges,)
+# def allegro_call(
+#     Linear,
+#     MultiLayerPerceptron,
+#     self,
+#     node_attrs: jnp.ndarray,  # jax.nn.one_hot(z, num_species)
+#     vectors: e3nn.IrrepsArray,  # [n_edges, 3]
+#     senders: jnp.ndarray,  # [n_edges]
+#     receivers: jnp.ndarray,  # [n_edges]
+#     edge_feats: Optional[e3nn.IrrepsArray] = None,  # [n_edges, irreps]
+# ) -> e3nn.IrrepsArray:
+#     num_edges = vectors.shape[0]
+#     num_nodes = node_attrs.shape[0]
+#     assert vectors.shape == (num_edges, 3)
+#     assert node_attrs.shape == (num_nodes, node_attrs.shape[-1])
+#     assert senders.shape == (num_edges,)
+#     assert receivers.shape == (num_edges,)
 
-    assert vectors.irreps in ["1o", "1e"]
-    irreps = e3nn.Irreps(self.irreps)
-    irreps_out = e3nn.Irreps(self.output_irreps)
+#     assert vectors.irreps in ["1o", "1e"]
+#     irreps = e3nn.Irreps(self.irreps)
+#     irreps_out = e3nn.Irreps(self.output_irreps)
 
-    irreps_layers = [irreps] * self.num_layers + [irreps_out]
-    irreps_layers = filter_layers(irreps_layers, self.max_ell)
+#     irreps_layers = [irreps] * self.num_layers + [irreps_out]
+#     irreps_layers = filter_layers(irreps_layers, self.max_ell)
 
-    vectors = vectors / self.radial_cutoff
+#     vectors = vectors / self.radial_cutoff
 
-    d = e3nn.norm(vectors).array.squeeze(1)
-    x = jnp.concatenate(
-        [
-            normalized_bessel(d, self.n_radial_basis),
-            node_attrs[senders],
-            node_attrs[receivers],
-        ],
-        axis=1,
-    )
-    assert x.shape == (
-        num_edges,
-        self.n_radial_basis + 2 * node_attrs.shape[-1],
-    )
+#     d = e3nn.norm(vectors).array.squeeze(1)
+#     x = jnp.concatenate(
+#         [
+#             normalized_bessel(d, self.n_radial_basis),
+#             node_attrs[senders],
+#             node_attrs[receivers],
+#         ],
+#         axis=1,
+#     )
+#     assert x.shape == (
+#         num_edges,
+#         self.n_radial_basis + 2 * node_attrs.shape[-1],
+#     )
 
-    # Protection against exploding dummy edges:
-    x = jnp.where(d[:, None] == 0.0, 0.0, x)
+#     # Protection against exploding dummy edges:
+#     x = jnp.where(d[:, None] == 0.0, 0.0, x)
 
-    x = MultiLayerPerceptron(
-        (
-            self.mlp_n_hidden // 8,
-            self.mlp_n_hidden // 4,
-            self.mlp_n_hidden // 2,
-            self.mlp_n_hidden,
-        ),
-        self.mlp_activation,
-        output_activation=False,
-    )(x)
-    x = u(d, self.p)[:, None] * x
-    assert x.shape == (num_edges, self.mlp_n_hidden)
+#     x = MultiLayerPerceptron(
+#         (
+#             self.mlp_n_hidden // 8,
+#             self.mlp_n_hidden // 4,
+#             self.mlp_n_hidden // 2,
+#             self.mlp_n_hidden,
+#         ),
+#         self.mlp_activation,
+#         output_activation=False,
+#     )(x)
+#     x = u(d, self.p)[:, None] * x
+#     assert x.shape == (num_edges, self.mlp_n_hidden)
 
-    irreps_Y = irreps_layers[0].filter(
-        keep=lambda mir: vectors.irreps[0].ir.p ** mir.ir.l == mir.ir.p
-    )
-    V = e3nn.spherical_harmonics(irreps_Y, vectors, True)
+#     irreps_Y = irreps_layers[0].filter(
+#         keep=lambda mir: vectors.irreps[0].ir.p ** mir.ir.l == mir.ir.p
+#     )
+#     V = e3nn.spherical_harmonics(irreps_Y, vectors, True)
 
-    if edge_feats is not None:
-        V = e3nn.concatenate([V, edge_feats])
-    w = MultiLayerPerceptron((V.irreps.num_irreps,), act=None)(x)
-    V = w * V
-    assert V.shape == (num_edges, V.irreps.dim)
+#     if edge_feats is not None:
+#         V = e3nn.concatenate([V, edge_feats])
+#     w = MultiLayerPerceptron((V.irreps.num_irreps,), act=None)(x)
+#     V = w * V
+#     assert V.shape == (num_edges, V.irreps.dim)
 
-    for irreps in irreps_layers[1:]:
-        y, V = allegro_layer_call(
-            Linear,
-            MultiLayerPerceptron,
-            irreps,
-            self,
-            vectors,
-            x,
-            V,
-            senders,
-        )
+#     for irreps in irreps_layers[1:]:
+#         y, V = allegro_layer_call(
+#             Linear,
+#             MultiLayerPerceptron,
+#             irreps,
+#             self,
+#             vectors,
+#             x,
+#             V,
+#             senders,
+#         )
 
-        alpha = 0.5
-        x = (x + alpha * y) / jnp.sqrt(1 + alpha**2)
+#         alpha = 0.5
+#         x = (x + alpha * y) / jnp.sqrt(1 + alpha**2)
 
-    x = MultiLayerPerceptron((128,), act=None)(x)
+#     x = MultiLayerPerceptron((128,), act=None)(x)
 
-    xV = Linear(irreps_out)(e3nn.concatenate([x, V]))
+#     xV = Linear(irreps_out)(e3nn.concatenate([x, V]))
 
-    if xV.irreps != irreps_out:
-        raise ValueError(f"output_irreps {irreps_out} is not reachable")
+#     if xV.irreps != irreps_out:
+#         raise ValueError(f"output_irreps {irreps_out} is not reachable")
 
-    return xV
+#     return xV
