@@ -15,3 +15,5 @@ data/
 *.out
 
 models/__pycache__
+
+todos.md

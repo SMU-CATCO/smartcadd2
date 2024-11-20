@@ -10,7 +10,6 @@ import jraph
 import optax
 from sklearn.model_selection import train_test_split
 from tqdm import tqdm
-from torch_geometric.datasets import QM9
 import torch_geometric.transforms as T
 from torch_geometric.loader import DataLoader
 from functools import partial
@@ -21,12 +20,14 @@ parent_dir = os.path.dirname(current_dir)
 sys.path.insert(0, parent_dir)
 
 from models import *
-from data_loaders import qmx_batch_to_jraph, pad_graph_to_max_size
+from data_loaders import qmx_batch_to_jraph, pad_graph_to_max_size, QM40
 import utils
 
+EXTENSIVE_TARGETS = [1, 2, 3]
+MAX_Z = 17
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train 2D models on QM9")
+    parser = argparse.ArgumentParser(description="Train 2D models on QM40")
     parser.add_argument(
         "--dim", type=int, default=64, help="Dimension of the model"
     )
@@ -37,7 +38,7 @@ def parse_args():
         "--target", type=int, default=0, help="Target property"
     )
     parser.add_argument(
-        "--data_dir", type=str, default="/data/QM9", help="Data directory"
+        "--data_dir", type=str, default="/data/QM40", help="Data directory"
     )
     parser.add_argument(
         "--save_dir",
@@ -61,7 +62,7 @@ def parse_args():
         "--min_lr", type=float, default=0.00001, help="Minimum learning rate"
     )
     parser.add_argument(
-        "--epochs", type=int, default=300, help="Number of epochs"
+        "--epochs", type=int, default=1000, help="Number of epochs"
     )
     parser.add_argument(
         "--max_nodes", type=int, default=None, help="Maximum number of nodes"
@@ -86,7 +87,7 @@ def parse_args():
 
 def load_and_preprocess_data(args):
     print(f"Loading data from {args.data_dir}", flush=True)
-    pyg_dataset = QM9(
+    pyg_dataset = QM40(
         root=args.data_dir,
         transform=T.Compose(
             [
@@ -155,12 +156,12 @@ def load_and_preprocess_data(args):
 
 
 def create_model(args):
-    aggr_type = "mean" if args.target in [2, 3, 4] else "sum"
+    aggr_type = "mean" if args.target in EXTENSIVE_TARGETS else "sum"
     net_fn = None
     if args.model == "SchNet":
         net_fn = lambda graph: SchNet(
             n_atom_basis=args.dim,
-            max_z=9,
+            max_z=MAX_Z,
             n_gaussians=25,
             n_filters=args.dim,
             mean=0.0,
@@ -363,7 +364,7 @@ if __name__ == "__main__":
         os.makedirs(args.save_dir, exist_ok=True)
 
     model_filename = os.path.join(
-        args.save_dir, f"qm9_jax_best_model_{args.target}.pkl"
+        args.save_dir, f"qm40_jax_best_model_{args.target}.pkl"
     )
     with open(model_filename, "wb") as f:
         import pickle

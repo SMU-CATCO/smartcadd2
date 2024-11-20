@@ -43,6 +43,7 @@ conversion = torch.tensor(
     ]
 )
 
+
 class QM40(InMemoryDataset):
 
     raw_url = None
@@ -56,8 +57,13 @@ class QM40(InMemoryDataset):
         pre_filter: Optional[Callable] = None,
         force_reload: bool = False,
     ) -> None:
-        super().__init__(root, transform, pre_transform, pre_filter,
-                         force_reload=force_reload)
+        super().__init__(
+            root,
+            transform,
+            pre_transform,
+            pre_filter,
+            force_reload=force_reload,
+        )
         self.load(self.processed_paths[0])
 
     @property
@@ -89,7 +95,6 @@ class QM40(InMemoryDataset):
         pass
 
     # def load(path):
-
 
     def process(self) -> None:
         try:
@@ -134,15 +139,17 @@ class QM40(InMemoryDataset):
         bond_df = pd.read_csv(self.raw_paths[2])
 
         # Pre-process xyz_df and bond_df
-        xyz_df_grouped = xyz_df.groupby('Zinc_id')
-        bond_df_grouped = bond_df.groupby('Zinc_id')
+        xyz_df_grouped = xyz_df.groupby("Zinc_id")
+        bond_df_grouped = bond_df.groupby("Zinc_id")
 
         data_list = []
         print("Processing raw data...")
         for mol_idx, row in tqdm(main_df.iterrows(), total=len(main_df)):
-            ID = row['Zinc_id']
-            SMILES = row['smile']
-            y = torch.tensor(row.iloc[2:].values.astype(np.float32), dtype=torch.float)
+            ID = row["Zinc_id"]
+            SMILES = row["smile"]
+            y = torch.tensor(
+                row.iloc[2:].values.astype(np.float32), dtype=torch.float
+            )
 
             mol_xyz = xyz_df_grouped.get_group(ID).reset_index(drop=True)
             mol_bonds = bond_df_grouped.get_group(ID).reset_index(drop=True)
@@ -156,7 +163,9 @@ class QM40(InMemoryDataset):
             atomic_numbers = np.array([atom.GetAtomicNum() for atom in atoms])
             type_idx = np.array([type_idx_map[num] for num in atomic_numbers])
             aromatic = np.array([int(atom.GetIsAromatic()) for atom in atoms])
-            hybridizations = np.array([atom.GetHybridization() for atom in atoms])
+            hybridizations = np.array(
+                [atom.GetHybridization() for atom in atoms]
+            )
             sp = (hybridizations == HybridizationType.SP).astype(int)
             sp2 = (hybridizations == HybridizationType.SP2).astype(int)
             sp3 = (hybridizations == HybridizationType.SP3).astype(int)
@@ -165,14 +174,22 @@ class QM40(InMemoryDataset):
             conf = Chem.Conformer(N)
             for i, row in mol_xyz.iterrows():
                 atoms[i].SetFormalCharge(int(round(row["charge"])))
-                conf.SetAtomPosition(i, (row["final_x"], row["final_y"], row["final_z"]))
+                conf.SetAtomPosition(
+                    i, (row["final_x"], row["final_y"], row["final_z"])
+                )
 
             pos = torch.tensor(conf.GetPositions(), dtype=torch.float)
             z = torch.tensor(atomic_numbers, dtype=torch.long)
 
             # Process bonds
-            bond_data = [(bond.GetBeginAtomIdx(), bond.GetEndAtomIdx(), bonds[bond.GetBondType()]) 
-                        for bond in mol.GetBonds()]
+            bond_data = [
+                (
+                    bond.GetBeginAtomIdx(),
+                    bond.GetEndAtomIdx(),
+                    bonds[bond.GetBondType()],
+                )
+                for bond in mol.GetBonds()
+            ]
             rows, cols, edge_types = zip(*bond_data)
             rows, cols = rows + cols, cols + rows  # Add reverse edges
             edge_types = edge_types + edge_types
@@ -180,7 +197,9 @@ class QM40(InMemoryDataset):
             edge_index = torch.tensor([rows, cols], dtype=torch.long)
             edge_type = torch.tensor(edge_types, dtype=torch.long)
             edge_attr = one_hot(edge_type, num_classes=len(bonds))
-            edge_attr2 = torch.tensor(mol_bonds['lmod'].tolist(), dtype=torch.float)
+            edge_attr2 = torch.tensor(
+                mol_bonds["lmod"].tolist(), dtype=torch.float
+            )
 
             # Sort edges
             perm = (edge_index[0] * N + edge_index[1]).argsort()
@@ -195,12 +214,27 @@ class QM40(InMemoryDataset):
 
             # Create node features
             x1 = one_hot(torch.tensor(type_idx), num_classes=len(types))
-            x2 = torch.tensor(np.array([aromatic, sp, sp2, sp3, num_hs]), dtype=torch.float).t().contiguous()
+            x2 = (
+                torch.tensor(
+                    np.array([aromatic, sp, sp2, sp3, num_hs]),
+                    dtype=torch.float,
+                )
+                .t()
+                .contiguous()
+            )
             x = torch.cat([x1, x2], dim=-1)
 
             data = Data(
-                x=x, z=z, pos=pos, edge_index=edge_index, smiles=SMILES,
-                edge_attr=edge_attr, edge_attr2=edge_attr2, y=y * conversion.view(1, -1), name=ID, idx=mol_idx,
+                x=x,
+                z=z,
+                pos=pos,
+                edge_index=edge_index,
+                smiles=SMILES,
+                edge_attr=edge_attr,
+                edge_attr2=edge_attr2,
+                y=y * conversion.view(1, -1),
+                name=ID,
+                idx=mol_idx,
             )
 
             if self.pre_filter is not None and not self.pre_filter(data):

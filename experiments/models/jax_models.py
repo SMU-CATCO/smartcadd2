@@ -3,6 +3,7 @@ import jax
 import jax.numpy as jnp
 import haiku as hk
 import jraph
+import jax.tree_util as tree
 # import e3nn_jax as e3nn
 
 
@@ -157,7 +158,7 @@ class SchNet(hk.Module):
         )
 
         self.atomwise = hk.nets.MLP(
-            output_sizes=[64, 1], activation=shifted_softplus, name="atomwise"
+            output_sizes=[32, 1], activation=shifted_softplus, name="atomwise"
         )
 
     @staticmethod
@@ -169,7 +170,11 @@ class SchNet(hk.Module):
         atoms = graph.nodes["z"]
         senders = graph.senders
         receivers = graph.receivers
+        num_graphs = graph.n_node.shape[0]
         dR = graph.edges["edge_attr"]
+        sum_n_node = tree.tree_leaves(graph.nodes)[0].shape[0]
+        node_mask = jraph.get_node_padding_mask(graph)
+        edge_mask = jraph.get_edge_padding_mask(graph)
 
         # Get embedding for atomic numbers
         x = self.embedding(atoms)
@@ -178,24 +183,27 @@ class SchNet(hk.Module):
 
         # Compute interactions
         for interaction in self.interactions.layers:
-            v = interaction(x, dR, senders, receivers, dR_expanded)
+            v = interaction(x, dR, senders, receivers, edge_mask, dR_expanded)
             x = x + v
 
         # Compute energy contributions
         yi = self.atomwise(x)
-        yi = self.standardize(yi, self.mean, self.stddev)
+        # yi = self.standardize(yi, self.mean, self.stddev)
 
         # mask padded nodes
-        mask = jraph.get_node_padding_mask(graph)
-        yi = jnp.squeeze(yi) * mask
+        yi = jnp.squeeze(yi) * node_mask
 
         if self.per_atom:
             return yi
 
+        # global pooling
+        graph_idx = jnp.repeat(
+            jnp.arange(num_graphs), graph.n_node, total_repeat_length=sum_n_node
+        )
         if self.aggr_type == "sum":
-            return jnp.sum(yi, axis=0)
+            return jraph.segment_sum(yi, segment_ids=graph_idx, num_segments=num_graphs)
         elif self.aggr_type == "mean":
-            return jnp.mean(yi, axis=0)
+            return jraph.segment_mean(yi, segment_ids=graph_idx, num_segments=num_graphs)
 
 
 ### Allegro ###
