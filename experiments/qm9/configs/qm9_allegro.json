@@ -1,0 +1,13 @@
+{
+    "target": 4,
+    "dim": 1024,
+    "batch_size": 16,
+    "learning_rate": 0.001,
+    "epochs": 1000,
+    "l2_lambda": 0.0,
+    "model": "Allegro",
+    "max_nodes": 29,
+    "max_edges": 812,
+    "layers": 3,
+    "r_cutoff": 10.0
+}

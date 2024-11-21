@@ -24,6 +24,8 @@ from models import *
 from data_loaders import qmx_batch_to_jraph, pad_graph_to_max_size
 import utils
 
+EXTENSIVE_TARGETS = [2, 3, 4]
+MAX_Z = 9
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train 2D models on QM9")
@@ -112,12 +114,13 @@ def load_and_preprocess_data(args):
         flush=True,
     )
 
+
     # split datasets
     train_dataset, test_dataset = train_test_split(
-        pyg_dataset, test_size=0.2, random_state=42
+        pyg_dataset, test_size=0.1, random_state=42
     )
     train_dataset, val_dataset = train_test_split(
-        train_dataset, test_size=0.2, random_state=42
+        train_dataset, test_size=0.1, random_state=42
     )
 
     train_loader = DataLoader(
@@ -155,12 +158,12 @@ def load_and_preprocess_data(args):
 
 
 def create_model(args):
-    aggr_type = "mean" if args.target in [2, 3, 4] else "sum"
+    aggr_type = "mean" if args.target in EXTENSIVE_TARGETS else "sum"
     net_fn = None
     if args.model == "SchNet":
         net_fn = lambda graph: SchNet(
             n_atom_basis=args.dim,
-            max_z=9,
+            max_z=MAX_Z,
             n_gaussians=25,
             n_filters=args.dim,
             mean=0.0,
@@ -168,6 +171,15 @@ def create_model(args):
             r_cutoff=args.r_cutoff,
             n_interactions=args.layers,
             per_atom=False,
+            aggr_type=aggr_type,
+        )(graph)
+    elif args.model == "Allegro":
+        net_fn = lambda graph: Allegro(
+            avg_num_neighbors=3,
+            mlp_n_hidden=args.dim,
+            mlp_n_layers=args.layers,
+            radial_cutoff=args.r_cutoff,
+            n_species=MAX_Z,
             aggr_type=aggr_type,
         )(graph)
 
@@ -242,17 +254,20 @@ def train(
 
     params = model.init(rng, graph_init)
 
+    # Calculate total training steps for the exponential decay
+    total_steps = args.epochs * len(train_loader)
+    schedule_fn = optax.exponential_decay(
+        init_value=args.lr,
+        transition_steps=total_steps // 10,  # Decay every 10% of total steps
+        decay_rate=0.96,
+        end_value=args.min_lr,
+    )
+
     optimizer = optax.chain(
         # optax.clip_by_global_norm(1.0),
-        optax.adam(learning_rate=args.lr)
+        optax.adam(learning_rate=schedule_fn)
     )
     opt_state = optimizer.init(params)
-
-    min_lr = args.min_lr
-    scheduler = optax.contrib.reduce_on_plateau(
-        patience=10, factor=0.96, rtol=0.0001, min_scale=min_lr / args.lr
-    )
-    scheduler_state = scheduler.init(params)
 
     params = jax.block_until_ready(params)
     print(f"Model compiled", flush=True)
@@ -277,7 +292,7 @@ def train(
                 graph,
                 graph.globals["y"],
                 args.l2_lambda,
-                scheduler_state.scale,
+                1.0,
                 optimizer_update,
                 model_fn,
             )
@@ -312,20 +327,23 @@ def train(
             if test_error < best_test_error:
                 best_test_error = test_error
 
-        # Adjust learning rate
-        _, scheduler_state = scheduler.update(
-            updates=params, state=scheduler_state, value=val_error
-        )
+        # # Adjust learning rate
+        # _, scheduler_state = scheduler.update(
+        #     updates=params, state=scheduler_state, value=val_error
+        # )
+        # Update the learning rate display in the progress bar
+        current_step = epoch * len(train_loader)
+        current_lr = schedule_fn(current_step)
 
         peak_memory = utils.get_gpu_memory_usage()
 
         pbar.set_postfix(
             {
                 "Epoch": f"{epoch:d}",
-                "LR": f"{scheduler_state.scale * args.lr:.6f}",
+                "LR": f"{current_lr:.6f}",
                 "Loss": f"{epoch_loss:.6f}",
                 "Val MAE": f"{val_error:.6f}",
-                "Best Test MAE": f"{best_test_error:.6f}", 
+                "Best Test MAE": f"{best_test_error:.6f}",
                 "Peak Memory": f"{peak_memory:.2f}",
             }
         )

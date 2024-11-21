@@ -1,0 +1,13 @@
+{
+    "target": 0,
+    "dim": 64,
+    "batch_size": 128,
+    "learning_rate": 0.0001,
+    "epochs": 1000,
+    "l2_lambda": 0.0,
+    "model": "SchNet",
+    "max_nodes": 29,
+    "max_edges": 812,
+    "layers": 6,
+    "r_cutoff": 20.0
+}

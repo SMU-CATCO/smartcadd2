@@ -4,11 +4,11 @@ import jax.numpy as jnp
 import haiku as hk
 import jraph
 import jax.tree_util as tree
-# import e3nn_jax as e3nn
+import e3nn_jax as e3nn
 
 
 from .jax_layers import (
-    EGNNLayer, Interaction, GaussianSmearing, #allegro_call
+    EGNNLayer, Interaction, GaussianSmearing, allegro_call
 )
 from .model_utils import shifted_softplus
 
@@ -206,54 +206,155 @@ class SchNet(hk.Module):
             return jraph.segment_mean(yi, segment_ids=graph_idx, num_segments=num_graphs)
 
 
-### Allegro ###
+### Allegro adapted from https://github.com/mariogeiger/allegro-jax/tree/main###
 
 
-# class AllegroHaiku(hk.Module):
+class Allegro(hk.Module):
 
-#     def __init__(
-#         self,
-#         avg_num_neighbors: float,
-#         max_ell: int = 3,
-#         irreps: e3nn.Irreps = 128
-#         * e3nn.Irreps("0o + 1o + 1e + 2e + 2o + 3o + 3e"),
-#         mlp_activation: Callable[[jnp.ndarray], jnp.ndarray] = jax.nn.silu,
-#         mlp_n_hidden: int = 1024,
-#         mlp_n_layers: int = 3,
-#         p: int = 6,
-#         n_radial_basis: int = 8,
-#         radial_cutoff: float = 1.0,
-#         output_irreps: e3nn.Irreps = e3nn.Irreps("0e"),
-#         num_layers: int = 3,
-#     ):
-#         super().__init__()
-#         self.avg_num_neighbors = avg_num_neighbors
-#         self.max_ell = max_ell
-#         self.irreps = irreps
-#         self.mlp_activation = mlp_activation
-#         self.mlp_n_hidden = mlp_n_hidden
-#         self.mlp_n_layers = mlp_n_layers
-#         self.p = p
-#         self.n_radial_basis = n_radial_basis
-#         self.radial_cutoff = radial_cutoff
-#         self.output_irreps = output_irreps
-#         self.num_layers = num_layers
+    def __init__(
+        self,
+        avg_num_neighbors: float,
+        max_ell: int = 3,
+        irreps: e3nn.Irreps = 128
+        * e3nn.Irreps("0o + 1o + 1e + 2e + 2o + 3o + 3e"),
+        mlp_activation: Callable[[jnp.ndarray], jnp.ndarray] = jax.nn.silu,
+        mlp_n_hidden: int = 1024,
+        mlp_n_layers: int = 3,
+        p: int = 6,
+        n_radial_basis: int = 8,
+        radial_cutoff: float = 10.0,
+        output_irreps: e3nn.Irreps = e3nn.Irreps("0e"),
+        num_layers: int = 3,
+        n_species: int = 9,
+        aggr_type: str = "sum",
+    ):
+        super().__init__()
+        self.avg_num_neighbors = avg_num_neighbors
+        self.max_ell = max_ell
+        self.irreps = irreps
+        self.mlp_activation = mlp_activation
+        self.mlp_n_hidden = mlp_n_hidden
+        self.mlp_n_layers = mlp_n_layers
+        self.p = p
+        self.n_radial_basis = n_radial_basis
+        self.radial_cutoff = radial_cutoff
+        self.output_irreps = output_irreps
+        self.num_layers = num_layers
+        self.n_species = n_species
+        self.aggr_type = aggr_type
 
-#     def __call__(
-#         self,
-#         node_attrs: jnp.ndarray,  # jax.nn.one_hot(z, num_species)
-#         vectors: e3nn.IrrepsArray,  # [n_edges, 3]
-#         senders: jnp.ndarray,  # [n_edges]
-#         receivers: jnp.ndarray,  # [n_edges]
-#         edge_feats: Optional[e3nn.IrrepsArray] = None,  # [n_edges, irreps]
-#     ) -> e3nn.IrrepsArray:
-#         return allegro_call(
-#             e3nn.haiku.Linear,
-#             e3nn.haiku.MultiLayerPerceptron,
-#             self,
-#             node_attrs,
-#             vectors,
-#             senders,
-#             receivers,
-#             edge_feats,
-#         )
+    def _get_scaling_parameters(self):
+        # Initialize learnable parameters with constraints
+        pair_scale_raw = hk.get_parameter(
+            "species_pair_scale_raw",
+            shape=[self.n_species, self.n_species],
+            init=hk.initializers.RandomNormal(stddev=0.01),
+        )
+        # Make pair scaling symmetric and positive
+        species_pair_scale = jax.nn.softplus(
+            (pair_scale_raw + pair_scale_raw.T) / 2
+        )
+
+        species_scale = jax.nn.softplus(
+            hk.get_parameter(
+                "species_scale",
+                shape=[self.n_species],
+                init=hk.initializers.Constant(0.0),
+            )
+        )
+
+        species_shift = hk.get_parameter(
+            "species_shift",
+            shape=[self.n_species],
+            init=hk.initializers.Constant(0.0),
+        )
+
+        return species_pair_scale, species_scale, species_shift
+
+    def compute_system_energy(
+        self,
+        edge_energies: jnp.ndarray,  # [n_edges]
+        senders: jnp.ndarray,        # [n_edges]
+        receivers: jnp.ndarray,      # [n_edges]
+        atom_types: jnp.ndarray,     # [n_nodes]
+        n_nodes: jnp.ndarray,        # [n_graphs] number of nodes per graph
+        graph_idx: jnp.ndarray,      # [n_nodes] graph index for each node
+        n_graphs: int,               # total number of graphs in batch
+    ) -> jnp.ndarray:               # [n_graphs] energy per graph
+        species_pair_scale, species_scale, species_shift = self._get_scaling_parameters()
+
+        # 1. Scale edge energies by species pair factors
+        sender_types = atom_types[senders]
+        receiver_types = atom_types[receivers]
+        pair_scales = species_pair_scale[sender_types, receiver_types]
+        scaled_edge_energies = edge_energies * pair_scales
+
+        # 2. Sum scaled edge energies into per-atom energies
+        atom_energies = jraph.segment_sum(
+            scaled_edge_energies, 
+            segment_ids=senders,
+            num_segments=atom_types.shape[0]
+        )
+
+        # 3. Apply per-species scaling and shift
+        atom_energies = atom_energies * species_scale[atom_types] + species_shift[atom_types]
+
+        # 4. Sum atom energies per graph
+        if self.aggr_type == "sum":
+            system_energies = jraph.segment_sum(
+                atom_energies,
+                segment_ids=graph_idx,
+                num_segments=n_graphs
+            )  # [n_graphs]
+        elif self.aggr_type == "mean":
+            system_energies = jraph.segment_mean(
+                atom_energies,
+                segment_ids=graph_idx,
+                num_segments=n_graphs
+            )  # [n_graphs]
+
+        return system_energies
+
+
+    def __call__(
+        self,
+        graph: jraph.GraphsTuple,
+    ) -> jnp.ndarray:  # [n_graphs]
+        atom_types = graph.nodes["z"]
+        node_attrs = jax.nn.one_hot(atom_types, self.n_species)
+        vectors = e3nn.IrrepsArray(
+            "1o",
+            graph.nodes["pos"][graph.receivers]
+            - graph.nodes["pos"][graph.senders],
+        )
+
+        edge_features = allegro_call(
+            e3nn.haiku.Linear,
+            e3nn.haiku.MultiLayerPerceptron,
+            self,
+            node_attrs,
+            vectors,
+            graph.senders,
+            graph.receivers,
+        )
+
+        # Create graph_idx array mapping each node to its graph
+        graph_idx = jnp.repeat(
+            jnp.arange(graph.n_node.shape[0]),  # [n_graphs]
+            graph.n_node,                        # [n_graphs]
+            total_repeat_length=atom_types.shape[0]  # total number of nodes
+        )
+
+        # Compute system energy with learned scaling
+        edge_energies = edge_features.array[..., 0]  # Take first component if multiple
+        system_energies = self.compute_system_energy(
+            edge_energies=edge_energies,
+            senders=graph.senders,
+            receivers=graph.receivers,
+            atom_types=atom_types,
+            n_nodes=graph.n_node,
+            graph_idx=graph_idx,
+            n_graphs=graph.n_node.shape[0],
+        )
+
+        return system_energies
