@@ -315,7 +315,6 @@ class Allegro(hk.Module):
 
         return system_energies
 
-
     def __call__(
         self,
         graph: jraph.GraphsTuple,
@@ -358,3 +357,4 @@ class Allegro(hk.Module):
         )
 
         return system_energies
+

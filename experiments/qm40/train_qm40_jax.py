@@ -83,6 +83,9 @@ def parse_args():
     parser.add_argument(
         "--r_cutoff", type=float, default=6.0, help="Cutoff radius"
     )
+    parser.add_argument(
+        "--save_every", type=int, default=100, help="Save every n epochs"
+    )
     return parser.parse_args()
 
 
@@ -124,6 +127,7 @@ def load_and_preprocess_data(args):
 
     train_loader = DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=True
+    )
     val_loader = DataLoader(
         val_dataset, batch_size=args.batch_size, shuffle=False
     )
@@ -155,6 +159,7 @@ def load_and_preprocess_data(args):
     )
 
 
+
 def create_model(args):
     aggr_type = "mean" if args.target in EXTENSIVE_TARGETS else "sum"
     net_fn = None
@@ -175,12 +180,11 @@ def create_model(args):
     return hk.without_apply_rng(hk.transform(net_fn))
 
 
-@partial(jax.jit, static_argnames=["l2_lambda", "model_fn"])
+@partial(jax.jit, static_argnames=["model_fn"])
 def loss_fn(
     params,
     graph,
     target,
-    l2_lambda,
     model_fn,
 ):
     pred = model_fn(params, graph)
@@ -189,25 +193,24 @@ def loss_fn(
     mse_loss = (mse_loss * mask).sum() / mask.sum()
 
     # Add L2 regularization
-    l2_loss = 0.5 * sum(
-        jnp.sum(jnp.square(p)) for p in jax.tree_util.tree_leaves(params)
-    )
+    # l2_loss = 0.5 * sum(
+    #     jnp.sum(jnp.square(p)) for p in jax.tree_util.tree_leaves(params)
+    # )
 
-    return mse_loss + l2_lambda * l2_loss
+    return mse_loss #+ l2_lambda * l2_loss
 
 
-@partial(jax.jit, static_argnames=["l2_lambda", "optimizer_update", "model_fn"])
+@partial(jax.jit, static_argnames=["optimizer_update", "model_fn"])
 def update(
     params,
     opt_state,
     graph,
     target,
-    l2_lambda,
     scheduler_scale,
     optimizer_update,
     model_fn,
 ):
-    loss, grads = jax.value_and_grad(loss_fn)(params, graph, target, l2_lambda, model_fn)
+    loss, grads = jax.value_and_grad(loss_fn)(params, graph, target, model_fn)
     updates, opt_state = optimizer_update(grads, opt_state, params)
     updates = optax.tree_utils.tree_scalar_mul(scheduler_scale, updates)
     params = optax.apply_updates(params, updates)
@@ -280,7 +283,6 @@ def train(
                 opt_state,
                 graph,
                 graph.globals["y"],
-                args.l2_lambda,
                 1.0,
                 optimizer_update,
                 model_fn,
@@ -336,6 +338,15 @@ def train(
                 "Peak Memory": f"{peak_memory:.2f}",
             }
         )
+
+        if epoch % args.save_every == 0:
+            model_filename = os.path.join(
+                args.save_dir, f"qm40_{args.model}_{args.target}_{epoch}.pkl"
+            )
+            os.makedirs(args.save_dir, exist_ok=True)
+            with open(model_filename, "wb") as f:
+                pickle.dump(best_params, f)
+            print(f"Model saved to {model_filename}", flush=True)
 
     return best_params, best_test_error
 
